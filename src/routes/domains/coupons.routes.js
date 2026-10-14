@@ -1,0 +1,10 @@
+const router = require('express').Router();
+const controller = require('../../controllers/couponController');
+const cartController = require('../../controllers/cartController');
+const { auth, adminOnly } = require('../../middleware/auth');
+router.post('/validate', auth, cartController.validateCoupon);
+router.get('/', auth, adminOnly, controller.listCoupons);
+router.post('/', auth, adminOnly, controller.createCoupon);
+router.put('/:id', auth, adminOnly, controller.updateCoupon);
+router.delete('/:id', auth, adminOnly, controller.deleteCoupon);
+module.exports = router;

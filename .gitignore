@@ -1,0 +1,59 @@
+# Dependencies
+node_modules/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Runtime files
+tmp/
+temp/
+*.pid
+*.seed
+*.pid.lock
+
+# Coverage and test output
+coverage/
+
+# Build output
+dist/
+build/
+
+# Cache
+.cache/
+.npm/
+.eslintcache
+
+# Operating system files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editor settings
+.vscode/
+.idea/
+
+# Private keys and certificates
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Database backups and dumps
+*.sql
+*.sqlite
+*.sqlite3
+*.db
+
+# Optional: uploaded user files
+# Uncomment these only if uploads are generated at runtime
+# uploads/*
+# !uploads/.gitkeep
