@@ -11,6 +11,7 @@ router.use("/products", require("./domains/products.routes"));
 // Location and address APIs
 router.use("/locations", require("./domains/locations.routes"));
 router.use("/addresses", require("./domains/addresses.routes"));
+router.use('/uploads', require('./domains/uploads.routes'));
 
 // Shopping APIs
 router.use("/cart", require("./domains/cart.routes"));
