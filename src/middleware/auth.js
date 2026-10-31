@@ -1,55 +1,97 @@
+
 const jwt = require('jsonwebtoken');
 const { User } = require('../models');
 const { fail } = require('../utils/response');
 
+/**
+ * JWT authentication middleware
+ *
+ * Validates Bearer token, checks the user account,
+ * and attaches the authenticated user to req.user.
+ */
 exports.auth = async (req, res, next) => {
   try {
-    const header = req.headers.authorization || '';
+    const authorization = req.headers.authorization;
 
-    // ---- DEBUG ----
-    console.log('[AUTH] ----');
-    console.log('[AUTH] path:', req.method, req.originalUrl);
-    console.log('[AUTH] header present:', Boolean(header));
-    console.log('[AUTH] header prefix:', header.slice(0, 30));
-    console.log('[AUTH] token length:', header.length - 7);
-    console.log('[AUTH] JWT_SECRET length:', process.env.JWT_SECRET?.length);
-    console.log('[AUTH] JWT_SECRET preview:', process.env.JWT_SECRET?.slice(0, 8) + '...');
-    // ----------------
-
-    if (!header.startsWith('Bearer ')) {
-      console.log('[AUTH] FAIL: no Bearer prefix');
+    // Check authorization header
+    if (
+      typeof authorization !== 'string' ||
+      !/^Bearer\s+\S+$/i.test(authorization)
+    ) {
       return fail(res, 'Authentication required', 401);
     }
 
-    const token = header.slice(7);
+    // Extract JWT token
+    const token = authorization.replace(/^Bearer\s+/i, '');
+
+    // Check JWT secret configuration
+    if (!process.env.JWT_SECRET) {
+      console.error('[AUTH] JWT_SECRET is not configured');
+
+      return fail(
+        res,
+        'Authentication service unavailable',
+        500
+      );
+    }
+
+    // Verify JWT token
     let payload;
+
     try {
-      payload = jwt.verify(token, process.env.JWT_SECRET);
-    } catch (jwtErr) {
-      console.log('[AUTH] jwt.verify FAILED:');
-      console.log('[AUTH]   name:', jwtErr.name);
-      console.log('[AUTH]   message:', jwtErr.message);
-      console.log('[AUTH]   token (first 60 chars):', token.slice(0, 60));
+      payload = jwt.verify(token, process.env.JWT_SECRET, {
+        algorithms: ['HS256'],
+      });
+    } catch (error) {
+      // Do not log JWT tokens or secrets
+      if (error.name === 'TokenExpiredError') {
+        return fail(res, 'Session expired. Please login again', 401);
+      }
+
       return fail(res, 'Invalid or expired token', 401);
     }
 
-    console.log('[AUTH] jwt.verify OK. payload:', payload);
+    // Validate JWT payload
+    if (
+      !payload ||
+      typeof payload !== 'object' ||
+      !Number.isSafeInteger(Number(payload.id)) ||
+      Number(payload.id) <= 0
+    ) {
+      return fail(res, 'Invalid authentication token', 401);
+    }
 
-    const user = await User.findByPk(payload.id);
-    console.log('[AUTH] user found:', Boolean(user));
+    // Find authenticated user
+    const user = await User.findByPk(Number(payload.id));
+
     if (!user || !user.isActive) {
       return fail(res, 'Account not available', 401);
     }
 
+    // Attach user to request
     req.user = user;
-    next();
+
+    return next();
   } catch (error) {
-    console.log('[AUTH] outer catch:', error.message);
-    return fail(res, 'Invalid or expired token', 401);
+    console.error('[AUTH] Authentication middleware error:', error.name);
+
+    return fail(res, 'Authentication service unavailable', 500);
   }
 };
 
+/**
+ * Admin-only authorization middleware
+ *
+ * Must be used after auth middleware.
+ */
 exports.adminOnly = (req, res, next) => {
-  if (req.user?.role !== 'admin') return fail(res, 'Admin access required', 403);
-  next();
+  if (!req.user) {
+    return fail(res, 'Authentication required', 401);
+  }
+
+  if (req.user.role !== 'admin') {
+    return fail(res, 'Admin access required', 403);
+  }
+
+  return next();
 };

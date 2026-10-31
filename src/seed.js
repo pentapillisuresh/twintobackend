@@ -39,10 +39,15 @@ const { DEFAULT_FEES } = require('./services/feeService');
       isActive: true
     });
 
-    await Setting.findOrCreate({
-      where: { key: 'feeSettings' },
-      defaults: { key: 'feeSettings', value: DEFAULT_FEES }
-    });
+const feeSettings = DEFAULT_FEES ?? {};
+
+await Setting.findOrCreate({
+  where: { key: 'feeSettings' },
+  defaults: {
+    key: 'feeSettings',
+    value: feeSettings
+  }
+});
 
     console.log(`Admin seed completed for ${email}`);
     console.log('Use ADMIN_PASSWORD from .env to sign in.');

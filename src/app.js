@@ -1,47 +1,220 @@
+
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
 const path = require('path');
+
 const routes = require('./routes');
-const errorHandler = require('./middleware/errorHandler');
+
+const paymentController = require(
+  './controllers/paymentController'
+);
+
+const errorHandler = require(
+  './middleware/errorHandler'
+);
+
 const { ok, fail } = require('./utils/response');
 
 const app = express();
+
+// ==========================================
+// 1. BASIC SECURITY
+// ==========================================
+
 app.disable('x-powered-by');
 
-// Relax helmet's crossOriginResourcePolicy so images load cross-origin
+// Security headers.
+// Allow cross-origin loading of uploaded images.
 app.use(
   helmet({
-    crossOriginResourcePolicy: { policy: 'cross-origin' },
+    crossOriginResourcePolicy: {
+      policy: 'cross-origin',
+    },
   })
 );
 
-const origins = String(process.env.FRONTEND_URL || 'http://localhost:5173')
+// ==========================================
+// 2. CORS CONFIGURATION
+// ==========================================
+
+// Allowed frontend origins.
+// FRONTEND_URL can contain multiple URLs,
+// separated by commas.
+
+const origins = String(
+  process.env.FRONTEND_URL ||
+    'http://localhost:5173,https://admin.twinto.store,https://twinto.store'
+)
   .split(',')
-  .map((x) => x.trim());
+  .map((origin) => origin.trim())
+  .filter(Boolean);
 
 app.use(
   cors({
-    origin: (origin, callback) =>
-      !origin || origins.includes('*') || origins.includes(origin)
-        ? callback(null, true)
-        : callback(new Error('Origin not allowed by CORS')),
+    origin: (origin, callback) => {
+      // Allow server-to-server requests
+      // that have no Origin header.
+      if (!origin || origins.includes(origin)) {
+        return callback(null, true);
+      }
+
+      console.error(
+        'CORS blocked origin:',
+        origin
+      );
+
+      return callback(
+        new Error('Origin not allowed by CORS')
+      );
+    },
+
+    methods: [
+      'GET',
+      'POST',
+      'PUT',
+      'PATCH',
+      'DELETE',
+      'OPTIONS',
+    ],
+
+    allowedHeaders: [
+      'Content-Type',
+      'Authorization',
+    ],
+
+    credentials: true,
+
+    optionsSuccessStatus: 204,
   })
 );
 
-app.use(express.json({ limit: '1mb' }));
-app.use(morgan('dev'));
+// ==========================================
+// 3. CASHFREE WEBHOOK
+// ==========================================
 
-// Serve uploaded images
-app.use('/uploads', express.static(path.resolve(__dirname, '../uploads')));
+// IMPORTANT:
+// Register the Cashfree webhook BEFORE
+// express.json().
+//
+// Cashfree signs the original request body.
+// Parsing JSON first would prevent reliable
+// signature verification.
+//
+// This endpoint must be publicly accessible
+// over HTTPS.
+//
+// Cashfree webhook authentication is handled
+// by verifyWebhookSignature() in
+// cashfreeService.js.
+//
+// Do not add customer JWT authentication
+// to this webhook endpoint.
 
-app.get('/health', (req, res) =>
-  ok(res, { status: 'running' }, 'TWINTO API is running')
+const API_PREFIX =
+  process.env.API_PREFIX || '/api/v1';
+
+app.post(
+  `${API_PREFIX}/payments/webhook`,
+
+  express.raw({
+    type: 'application/json',
+    limit: '1mb',
+  }),
+
+  paymentController.webhook
 );
 
-app.use(process.env.API_PREFIX || '/api/v1', routes);
-app.use((req, res) => fail(res, 'Route not found', 404));
+// ==========================================
+// 4. REQUEST BODY PARSING
+// ==========================================
+
+// Parse normal API JSON requests.
+// This is intentionally AFTER the webhook.
+
+app.use(
+  express.json({
+    limit: '1mb',
+  })
+);
+
+// Parse URL-encoded request bodies,
+// if needed by existing API routes.
+
+app.use(
+  express.urlencoded({
+    extended: true,
+    limit: '1mb',
+  })
+);
+
+// ==========================================
+// 5. REQUEST LOGGING
+// ==========================================
+
+app.use(morgan('dev'));
+
+// ==========================================
+// 6. STATIC UPLOADS
+// ==========================================
+
+// Serve uploaded images and other files.
+
+app.use(
+  '/uploads',
+
+  express.static(
+    path.resolve(
+      __dirname,
+      '../uploads'
+    )
+  )
+);
+
+// ==========================================
+// 7. HEALTH CHECK
+// ==========================================
+
+app.get('/health', (req, res) => {
+  return ok(
+    res,
+    {
+      status: 'running',
+    },
+    'TWINTO API is running'
+  );
+});
+
+// ==========================================
+// 8. MAIN API ROUTES
+// ==========================================
+
+app.use(
+  API_PREFIX,
+  routes
+);
+
+// ==========================================
+// 9. UNKNOWN ROUTES
+// ==========================================
+
+app.use((req, res) => {
+  return fail(
+    res,
+    'Route not found',
+    404
+  );
+});
+
+// ==========================================
+// 10. CENTRAL ERROR HANDLER
+// ==========================================
+
 app.use(errorHandler);
+
+// ==========================================
+// 11. EXPORT EXPRESS APP
+// ==========================================
 
 module.exports = app;
