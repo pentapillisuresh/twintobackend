@@ -1,87 +1,154 @@
 
-const crypto = require('crypto');
-
 const {
   Order,
-  Payment
-} = require('../models');
+  Payment,
+} = require("../models");
 
 const {
   ok,
-  fail
-} = require('../utils/response');
+  fail,
+} = require("../utils/response");
 
 const {
   createCashfreeSession,
   syncCashfreeOrder,
   validCheckout,
   verifyWebhookSignature,
-  env
-} = require('../services/cashfreeService');
+  env,
+} = require("../services/cashfreeService");
 
-// ==========================================
+// =====================================================
 // 1. ASYNC ERROR HANDLER
-// ==========================================
+// =====================================================
 
 const asyncHandler = (fn) =>
   (req, res, next) =>
-    Promise.resolve(
-      fn(req, res, next)
-    ).catch(next);
+    Promise.resolve(fn(req, res, next)).catch(next);
 
-// ==========================================
+// =====================================================
 // 2. VALIDATE ORDER ID
-// ==========================================
+// =====================================================
 
 function validOrderId(value) {
   const id = Number(value);
 
-  if (
-    !Number.isSafeInteger(id) ||
-    id <= 0
-  ) {
+  if (!Number.isSafeInteger(id) || id <= 0) {
     return null;
   }
 
   return id;
 }
 
-// ==========================================
-// 3. SAFE ERROR PAGE
-// ==========================================
+// =====================================================
+// 3. CASHFREE ERROR HELPERS
+// =====================================================
+
+function isMissingCashfreeOrder(error) {
+  return (
+    error?.cashfreeStatus === 404 &&
+    error?.cashfreeCode === "order_not_found"
+  );
+}
+
+async function clearStaleCashfreeSession(orderId) {
+  const payment = await Payment.findOne({
+    where: {
+      orderId,
+      provider: "CASHFREE",
+    },
+  });
+
+  if (payment) {
+    await payment.update({
+      cashfreeOrderId: null,
+      cashfreeSessionId: null,
+    });
+  }
+}
+
+async function verifyOrderSafely(order) {
+  const payment = await Payment.findOne({
+    where: {
+      orderId: order.id,
+      provider: "CASHFREE",
+    },
+  });
+
+  if (!payment) {
+    throw new Error("Cashfree payment record not found.");
+  }
+
+  // A session may not have been created yet.
+  // Keep the order pending instead of returning HTTP 500.
+  if (!payment.cashfreeOrderId) {
+    console.log(
+      "[CASHFREE] No session reference; keeping order pending:",
+      order.id
+    );
+
+    return order;
+  }
+
+  try {
+    return await syncCashfreeOrder(order.id);
+  } catch (error) {
+    if (isMissingCashfreeOrder(error)) {
+      console.warn(
+        "[CASHFREE] Missing order. Clearing stale session:",
+        order.id
+      );
+
+      await clearStaleCashfreeSession(order.id);
+
+      return order;
+    }
+
+    throw error;
+  }
+}
+
+
+// =====================================================
+// 4. SAFE HTML PAYMENT PAGE
+// =====================================================
 
 function escapeHtml(value) {
   return String(value)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 function paymentPage({
   title,
   message,
-  status = 'pending'
+  status = "pending",
 }) {
   const color =
-    status === 'success'
-      ? '#16a34a'
-      : status === 'failed'
-        ? '#dc2626'
-        : '#f59e0b';
+    status === "success"
+      ? "#16a34a"
+      : status === "failed"
+        ? "#dc2626"
+        : "#f59e0b";
+
+  const symbol =
+    status === "success"
+      ? "&#10003;"
+      : status === "failed"
+        ? "&#10005;"
+        : "!";
 
   return `
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-
   <meta
     name="viewport"
     content="width=device-width, initial-scale=1"
   />
-
   <title>${escapeHtml(title)} - TWINTO</title>
 
   <style>
@@ -145,15 +212,7 @@ function paymentPage({
 
 <body>
   <div class="card">
-    <div class="status">
-      ${
-        status === 'success'
-          ? '&#10003;'
-          : status === 'failed'
-            ? '&#10005;'
-            : '!'
-      }
-    </div>
+    <div class="status">${symbol}</div>
 
     <h1>${escapeHtml(title)}</h1>
 
@@ -172,31 +231,31 @@ function sendPaymentPage(
   {
     title,
     message,
-    status = 'pending',
-    httpStatus = 200
+    status = "pending",
+    httpStatus = 200,
   }
 ) {
   res.set({
-    'Content-Type': 'text/html; charset=utf-8',
-    'Cache-Control': 'no-store',
-    'Content-Security-Policy':
-      "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    "Content-Type": "text/html; charset=utf-8",
+    "Cache-Control": "no-store",
+    "Content-Security-Policy":
+      "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
   });
 
   return res.status(httpStatus).send(
     paymentPage({
       title,
       message,
-      status
+      status,
     })
   );
 }
 
-// ==========================================
-// 4. VERIFY CASHFREE PAYMENT
+// =====================================================
+// 5. VERIFY CASHFREE PAYMENT
 // POST /payments/verify
 // Authentication required
-// ==========================================
+// =====================================================
 
 exports.verifyPayment = asyncHandler(
   async (req, res) => {
@@ -207,7 +266,7 @@ exports.verifyPayment = asyncHandler(
     if (!orderId) {
       return fail(
         res,
-        'Valid order ID required',
+        "Valid order ID required",
         400
       );
     }
@@ -216,47 +275,57 @@ exports.verifyPayment = asyncHandler(
       where: {
         id: orderId,
         userId: req.user.id,
-        paymentMethod: 'CASHFREE'
-      }
+        paymentMethod: "CASHFREE",
+      },
     });
 
     if (!order) {
       return fail(
         res,
-        'Cashfree order not found',
+        "Cashfree order not found",
         404
       );
     }
 
-    // Always verify through Cashfree API.
-    // Never trust a success flag from the app.
-    const updatedOrder =
-      await syncCashfreeOrder(order.id);
+    // Never verify an already-paid order again.
+    if (order.paymentStatus === "PAID") {
+      return ok(
+        res,
+        {
+          orderId: order.id,
+          paymentMethod: order.paymentMethod,
+          paymentStatus: "PAID",
+          orderStatus: order.status,
+          isPaid: true,
+        },
+        "Payment already completed."
+      );
+    }
+
+    // Verify through Cashfree, not through the app.
+    const updatedOrder = await verifyOrderSafely(order);
 
     return ok(
       res,
       {
         orderId: updatedOrder.id,
-        paymentMethod:
-          updatedOrder.paymentMethod,
-        paymentStatus:
-          updatedOrder.paymentStatus,
-        orderStatus:
-          updatedOrder.status,
-        isPaid:
-          updatedOrder.paymentStatus ===
-          'PAID'
+        paymentMethod: updatedOrder.paymentMethod,
+        paymentStatus: updatedOrder.paymentStatus,
+        orderStatus: updatedOrder.status,
+        isPaid: updatedOrder.paymentStatus === "PAID",
+        requiresNewPaymentSession:
+          updatedOrder.paymentStatus !== "PAID",
       },
-      'Payment status verified'
+      "Payment status verified."
     );
   }
 );
 
-// ==========================================
-// 5. CUSTOMER PAYMENT STATUS
+// =====================================================
+// 6. CUSTOMER PAYMENT STATUS
 // GET /payments/status/:orderId
 // Authentication required
-// ==========================================
+// =====================================================
 
 exports.getPaymentStatus = asyncHandler(
   async (req, res) => {
@@ -267,7 +336,7 @@ exports.getPaymentStatus = asyncHandler(
     if (!orderId) {
       return fail(
         res,
-        'Valid order ID required',
+        "Valid order ID required",
         400
       );
     }
@@ -275,57 +344,209 @@ exports.getPaymentStatus = asyncHandler(
     const order = await Order.findOne({
       where: {
         id: orderId,
-        userId: req.user.id
-      }
+        userId: req.user.id,
+      },
     });
 
     if (!order) {
       return fail(
         res,
-        'Order not found',
+        "Order not found",
         404
       );
     }
 
-    const updatedOrder =
-      order.paymentMethod === 'CASHFREE'
-        ? await syncCashfreeOrder(order.id)
-        : order;
+    let updatedOrder = order;
 
-    return ok(res, {
-      orderId: updatedOrder.id,
-      orderNumber:
-        updatedOrder.orderNumber,
-      paymentMethod:
-        updatedOrder.paymentMethod,
-      paymentStatus:
-        updatedOrder.paymentStatus,
-      orderStatus:
-        updatedOrder.status,
-      isPaid:
-        updatedOrder.paymentStatus ===
-        'PAID'
-    });
+    if (
+      order.paymentMethod === "CASHFREE" &&
+      order.paymentStatus !== "PAID"
+    ) {
+      updatedOrder = await verifyOrderSafely(order);
+    }
+
+    return ok(
+      res,
+      {
+        orderId: updatedOrder.id,
+        orderNumber: updatedOrder.orderNumber,
+        paymentMethod: updatedOrder.paymentMethod,
+        paymentStatus: updatedOrder.paymentStatus,
+        orderStatus: updatedOrder.status,
+        isPaid: updatedOrder.paymentStatus === "PAID",
+        requiresNewPaymentSession:
+          updatedOrder.paymentMethod === "CASHFREE" &&
+          updatedOrder.paymentStatus !== "PAID",
+      },
+      "Payment status retrieved."
+    );
   }
 );
 
-// ==========================================
-// 6. ADMIN PAYMENT HISTORY
+// =====================================================
+// 7. RETRY CASHFREE PAYMENT
+// POST /orders/:id/retry-payment
+// Authentication required
+// =====================================================
+
+
+exports.retryCashfreePayment = asyncHandler(
+  async (req, res) => {
+    const orderId = validOrderId(req.params.id);
+
+    if (!orderId) {
+      return fail(res, "Valid order ID required", 400);
+    }
+
+    const order = await Order.findOne({
+      where: {
+        id: orderId,
+        userId: req.user.id,
+        paymentMethod: "CASHFREE",
+      },
+    });
+
+    if (!order) {
+      return fail(res, "Cashfree order not found", 404);
+    }
+
+    if (order.status === "CANCELLED") {
+      return fail(
+        res,
+        "Cancelled orders cannot be paid.",
+        409
+      );
+    }
+
+    if (order.paymentStatus === "PAID") {
+      return ok(
+        res,
+        {
+          order,
+          orderId: order.id,
+          paymentStatus: "PAID",
+          isPaid: true,
+          cashfree: null,
+        },
+        "This order is already paid."
+      );
+    }
+
+    const payment = await Payment.findOne({
+      where: {
+        orderId: order.id,
+        provider: "CASHFREE",
+      },
+    });
+
+    if (!payment) {
+      return fail(
+        res,
+        "Cashfree payment record not found",
+        404
+      );
+    }
+
+    // Verify only if an actual Cashfree order ID exists.
+    if (payment.cashfreeOrderId) {
+      try {
+        const verifiedOrder =
+          await syncCashfreeOrder(order.id);
+
+        if (verifiedOrder.paymentStatus === "PAID") {
+          return ok(
+            res,
+            {
+              order: verifiedOrder,
+              orderId: verifiedOrder.id,
+              paymentStatus: "PAID",
+              isPaid: true,
+              cashfree: null,
+            },
+            "Payment already completed."
+          );
+        }
+      } catch (error) {
+        if (isMissingCashfreeOrder(error)) {
+          console.warn(
+            "[RETRY PAYMENT] Clearing stale Cashfree order:",
+            payment.cashfreeOrderId
+          );
+
+          await clearStaleCashfreeSession(order.id);
+        } else {
+          throw error;
+        }
+      }
+    }
+
+    const latestOrder = await Order.findByPk(orderId);
+
+    if (!latestOrder || latestOrder.status === "CANCELLED") {
+      return fail(
+        res,
+        "Order is not available for payment",
+        409
+      );
+    }
+
+    if (!req.user?.id || !req.user?.mobile) {
+      return fail(
+        res,
+        "Customer mobile number is required.",
+        400
+      );
+    }
+
+    const cashfree = await createCashfreeSession(
+      latestOrder,
+      req.user
+    );
+
+    if (
+      !cashfree?.paymentSessionId ||
+      !cashfree?.cashfreeOrderId ||
+      !cashfree?.environment
+    ) {
+      throw new Error(
+        "Cashfree did not return complete payment session details."
+      );
+    }
+
+    return ok(
+      res,
+      {
+        order: latestOrder,
+        orderId: latestOrder.id,
+        paymentStatus: latestOrder.paymentStatus,
+        isPaid: false,
+        cashfree: {
+          paymentSessionId: cashfree.paymentSessionId,
+          cashfreeOrderId: cashfree.cashfreeOrderId,
+          environment: cashfree.environment,
+        },
+      },
+      "Payment session ready."
+    );
+  }
+);
+
+
+// =====================================================
+// 8. ADMIN PAYMENT HISTORY
 // GET /payments/order/:orderId
-// Admin authentication required in routes
-// ==========================================
+// Admin authentication required
+// =====================================================
 
 exports.getOrderPayments = asyncHandler(
   async (req, res) => {
-    // Defense in depth:
-    // the route must ALSO use admin middleware.
     if (
       !req.user ||
-      req.user.role !== 'admin'
+      String(req.user.role).toLowerCase() !== "admin"
     ) {
       return fail(
         res,
-        'Admin access required',
+        "Admin access required",
         403
       );
     }
@@ -337,50 +558,43 @@ exports.getOrderPayments = asyncHandler(
     if (!orderId) {
       return fail(
         res,
-        'Valid order ID required',
+        "Valid order ID required",
         400
       );
     }
 
-    const order = await Order.findByPk(
-      orderId
-    );
+    const order = await Order.findByPk(orderId);
 
     if (!order) {
       return fail(
         res,
-        'Order not found',
+        "Order not found",
         404
       );
     }
 
     const payments = await Payment.findAll({
       where: {
-        orderId: order.id
+        orderId: order.id,
       },
       order: [
-        ['createdAt', 'DESC']
-      ]
+        ["createdAt", "DESC"],
+      ],
     });
 
     return ok(
       res,
       payments,
-      'Payment history retrieved'
+      "Payment history retrieved."
     );
   }
 );
 
-// ==========================================
-// 7. CASHFREE CHECKOUT
+// =====================================================
+// 9. CASHFREE CHECKOUT
 // GET /payments/checkout/:id
-//
-// This route is accessed through a signed,
-// time-limited checkout URL.
-//
-// No customer JWT is required because the
-// URL contains a validated HMAC signature.
-// ==========================================
+// Signed URL required
+// =====================================================
 
 exports.checkout = asyncHandler(
   async (req, res) => {
@@ -390,11 +604,10 @@ exports.checkout = asyncHandler(
 
     if (!orderId) {
       return sendPaymentPage(res, {
-        title: 'Invalid Order',
-        message:
-          'The payment order ID is invalid.',
-        status: 'failed',
-        httpStatus: 400
+        title: "Invalid Order",
+        message: "The payment order ID is invalid.",
+        status: "failed",
+        httpStatus: 400,
       });
     }
 
@@ -409,116 +622,101 @@ exports.checkout = asyncHandler(
       )
     ) {
       return sendPaymentPage(res, {
-        title: 'Payment Link Expired',
+        title: "Payment Link Expired",
         message:
-          'This payment link is invalid or expired. Please return to TWINTO and try again.',
-        status: 'failed',
-        httpStatus: 403
+          "This payment link is invalid or expired. Please return to TWINTO and try again.",
+        status: "failed",
+        httpStatus: 403,
       });
     }
 
-    const order = await Order.findByPk(
-      orderId
-    );
+    const order = await Order.findByPk(orderId);
 
     if (
       !order ||
-      order.paymentMethod !== 'CASHFREE'
+      order.paymentMethod !== "CASHFREE"
     ) {
       return sendPaymentPage(res, {
-        title: 'Order Not Found',
-        message:
-          'The Cashfree order could not be found.',
-        status: 'failed',
-        httpStatus: 404
+        title: "Order Not Found",
+        message: "The Cashfree order could not be found.",
+        status: "failed",
+        httpStatus: 404,
       });
     }
 
-    if (order.status === 'CANCELLED') {
+    if (order.status === "CANCELLED") {
       return sendPaymentPage(res, {
-        title: 'Order Cancelled',
+        title: "Order Cancelled",
         message:
-          'This order has been cancelled. Payment is not available.',
-        status: 'failed',
-        httpStatus: 409
+          "This order has been cancelled. Payment is not available.",
+        status: "failed",
+        httpStatus: 409,
       });
     }
 
-    if (order.paymentStatus === 'PAID') {
+    if (order.paymentStatus === "PAID") {
       return sendPaymentPage(res, {
-        title: 'Already Paid',
+        title: "Already Paid",
         message:
-          'Payment has already been completed for this order.',
-        status: 'success'
+          "Payment has already been completed for this order.",
+        status: "success",
       });
     }
 
+    // Verify payment before opening checkout.
+    const updatedOrder = await verifyOrderSafely(order);
+
+    if (updatedOrder.paymentStatus === "PAID") {
+      return sendPaymentPage(res, {
+        title: "Payment Successful",
+        message: "Your order has already been paid.",
+        status: "success",
+      });
+    }
+
+    // Reload session after verification.
     const payment = await Payment.findOne({
       where: {
         orderId: order.id,
-        provider: 'CASHFREE'
-      }
+        provider: "CASHFREE",
+      },
     });
 
     if (
       !payment ||
-      !payment.cashfreeSessionId
+      !payment.cashfreeSessionId ||
+      !payment.cashfreeOrderId
     ) {
       return sendPaymentPage(res, {
-        title: 'Payment Unavailable',
+        title: "Payment Unavailable",
         message:
-          'The payment session is not ready. Please try again from the app.',
-        status: 'failed',
-        httpStatus: 409
+          "The payment session is missing or expired. Please return to the app and retry payment.",
+        status: "failed",
+        httpStatus: 409,
       });
     }
 
-    // Refresh status before showing checkout.
-    const updatedOrder =
-      await syncCashfreeOrder(order.id);
+    const sessionId = JSON.stringify(
+      payment.cashfreeSessionId
+    );
 
-    if (
-      updatedOrder.paymentStatus ===
-      'PAID'
-    ) {
-      return sendPaymentPage(res, {
-        title: 'Payment Successful',
-        message:
-          'Your order has already been paid.',
-        status: 'success'
-      });
-    }
-
-    const sessionId =
-      JSON.stringify(
-        payment.cashfreeSessionId
-      );
-
-    const mode =
-      JSON.stringify(
-        env() === 'production'
-          ? 'production'
-          : 'sandbox'
-      );
-
-    // Render Cashfree hosted checkout.
-    // Session ID is intentionally provided
-    // to Cashfree's browser SDK.
-    //
-    // Do not expose CASHFREE_SECRET_KEY.
+    const mode = JSON.stringify(
+      env() === "production"
+        ? "production"
+        : "sandbox"
+    );
 
     res.set({
-      'Content-Type':
-        'text/html; charset=utf-8',
-      'Cache-Control': 'no-store',
-      'Content-Security-Policy':
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-store",
+      "Content-Security-Policy":
         "default-src 'none'; " +
         "script-src https://sdk.cashfree.com 'unsafe-inline'; " +
         "connect-src https://*.cashfree.com; " +
         "frame-src https://*.cashfree.com; " +
         "style-src 'unsafe-inline'; " +
         "base-uri 'none'; " +
-        "form-action https://*.cashfree.com"
+        "form-action https://*.cashfree.com",
     });
 
     return res.send(`
@@ -534,9 +732,7 @@ exports.checkout = asyncHandler(
 
   <title>TWINTO Secure Payment</title>
 
-  <script
-    src="https://sdk.cashfree.com/js/v3/cashfree.js">
-  </script>
+  <script src="https://sdk.cashfree.com/js/v3/cashfree.js"></script>
 
   <style>
     body {
@@ -569,6 +765,10 @@ exports.checkout = asyncHandler(
       cursor: pointer;
     }
 
+    button:disabled {
+      opacity: .6;
+    }
+
     p {
       color: #64748b;
       line-height: 1.6;
@@ -581,13 +781,10 @@ exports.checkout = asyncHandler(
     <h2>TWINTO Secure Checkout</h2>
 
     <p>
-      Complete your payment securely
-      using Cashfree.
+      Complete your payment securely using Cashfree.
     </p>
 
-    <button
-      id="payButton"
-      type="button">
+    <button id="payButton" type="button">
       Pay Now
     </button>
 
@@ -599,16 +796,13 @@ exports.checkout = asyncHandler(
   <script>
     (function () {
       const button =
-        document.getElementById('payButton');
+        document.getElementById("payButton");
 
       const message =
-        document.getElementById('message');
+        document.getElementById("message");
 
-      const paymentSessionId =
-        ${sessionId};
-
-      const cashfreeMode =
-        ${mode};
+      const paymentSessionId = ${sessionId};
+      const cashfreeMode = ${mode};
 
       let started = false;
 
@@ -619,51 +813,39 @@ exports.checkout = asyncHandler(
         button.disabled = true;
 
         message.textContent =
-          'Opening Cashfree payment...';
+          "Opening Cashfree payment...";
 
         try {
-          if (
-            typeof window.Cashfree !==
-            'function'
-          ) {
-            throw new Error(
-              'Cashfree SDK could not load'
-            );
+          if (typeof window.Cashfree !== "function") {
+            throw new Error("Cashfree SDK could not load.");
           }
 
-          const cashfree =
-            window.Cashfree({
-              mode: cashfreeMode
-            });
+          const cashfree = window.Cashfree({
+            mode: cashfreeMode,
+          });
 
-          const result =
-            await cashfree.checkout({
-              paymentSessionId:
-                paymentSessionId,
-              redirectTarget: '_self'
-            });
+          const result = await cashfree.checkout({
+            paymentSessionId: paymentSessionId,
+            redirectTarget: "_self",
+          });
 
           if (result && result.error) {
-            throw new Error(
-              'Unable to start payment'
-            );
+            throw new Error("Unable to start payment.");
           }
+
         } catch (error) {
           started = false;
           button.disabled = false;
 
           message.textContent =
-            'Unable to open payment. Please try again.';
+            "Unable to open payment. Please return to TWINTO and try again.";
         }
       }
 
-      button.addEventListener(
-        'click',
-        startPayment
-      );
+      button.addEventListener("click", startPayment);
 
       message.textContent =
-        'Click Pay Now to continue.';
+        "Click Pay Now to continue.";
     })();
   </script>
 </body>
@@ -672,16 +854,10 @@ exports.checkout = asyncHandler(
   }
 );
 
-// ==========================================
-// 8. CASHFREE PAYMENT RETURN
+// =====================================================
+// 10. CASHFREE PAYMENT RETURN
 // GET /payments/return?order_id=123
-//
-// Cashfree redirects the browser here.
-//
-// IMPORTANT:
-// A redirect does not prove payment.
-// We verify using Cashfree's API.
-// ==========================================
+// =====================================================
 
 exports.returnFromCashfree = asyncHandler(
   async (req, res) => {
@@ -691,123 +867,112 @@ exports.returnFromCashfree = asyncHandler(
 
     if (!orderId) {
       return sendPaymentPage(res, {
-        title: 'Invalid Payment Return',
-        message:
-          'The payment return URL is invalid.',
-        status: 'failed',
-        httpStatus: 400
+        title: "Invalid Payment Return",
+        message: "The payment return URL is invalid.",
+        status: "failed",
+        httpStatus: 400,
       });
     }
 
-    const order = await Order.findByPk(
-      orderId
-    );
+    const order = await Order.findByPk(orderId);
 
     if (
       !order ||
-      order.paymentMethod !== 'CASHFREE'
+      order.paymentMethod !== "CASHFREE"
     ) {
       return sendPaymentPage(res, {
-        title: 'Order Not Found',
-        message:
-          'The Cashfree order could not be found.',
-        status: 'failed',
-        httpStatus: 404
+        title: "Order Not Found",
+        message: "The Cashfree order could not be found.",
+        status: "failed",
+        httpStatus: 404,
       });
     }
 
     try {
-      const updatedOrder =
-        await syncCashfreeOrder(
-          order.id
-        );
+      const updatedOrder = await verifyOrderSafely(order);
 
-      if (
-        updatedOrder.paymentStatus ===
-        'PAID'
-      ) {
+      if (updatedOrder.paymentStatus === "PAID") {
         return sendPaymentPage(res, {
-          title: 'Payment Successful',
+          title: "Payment Successful",
           message:
             `Your TWINTO order ${order.orderNumber} has been paid successfully. You can return to the app.`,
-          status: 'success'
+          status: "success",
         });
       }
 
-      if (
-        updatedOrder.paymentStatus ===
-        'FAILED'
-      ) {
+      if (updatedOrder.paymentStatus === "FAILED") {
         return sendPaymentPage(res, {
-          title: 'Payment Failed',
+          title: "Payment Failed",
           message:
-            'Your payment was not completed. Please return to the app to check the order.',
-          status: 'failed'
+            "Your payment was not completed. Please return to the app to check your order.",
+          status: "failed",
         });
       }
 
       return sendPaymentPage(res, {
-        title: 'Payment Pending',
+        title: "Payment Pending",
         message:
-          'We have not received payment confirmation yet. Please return to the app and check your order status.',
-        status: 'pending'
+          "We have not received payment confirmation yet. Please return to the app and check your order status.",
+        status: "pending",
       });
+
     } catch (error) {
       console.error(
-        'Cashfree return verification failed:',
+        "[CASHFREE RETURN] Verification failed:",
         error.message
       );
 
       return sendPaymentPage(res, {
-        title: 'Verification Pending',
+        title: "Verification Pending",
         message:
-          'We could not confirm your payment right now. Please check your order in the app. Do not pay again until its status is confirmed.',
-        status: 'pending',
-        httpStatus: 503
+          "We could not confirm your payment right now. Please check your order in the app. Do not pay again until its status is confirmed.",
+        status: "pending",
+        httpStatus: 503,
       });
     }
   }
 );
 
-// ==========================================
-// 9. CASHFREE WEBHOOK
+// =====================================================
+// 11. CASHFREE WEBHOOK
 // POST /payments/webhook
 //
-// Must receive RAW application/json body.
-// Do not apply express.json() before it.
-//
-// No customer JWT authentication.
-// Cashfree authenticates using signature.
-// ==========================================
+// IMPORTANT:
+// This route must receive RAW request body.
+// Do not apply express.json() before this route.
+// =====================================================
 
 exports.webhook = asyncHandler(
   async (req, res) => {
-    const timestamp =
-      req.get('x-webhook-timestamp');
+    const timestamp = req.get(
+      "x-webhook-timestamp"
+    );
 
-    const signature =
-      req.get('x-webhook-signature');
+    const signature = req.get(
+      "x-webhook-signature"
+    );
 
     if (!Buffer.isBuffer(req.body)) {
       return res.status(400).json({
         success: false,
-        message:
-          'Raw webhook body required'
+        message: "Raw webhook body required.",
       });
     }
 
-    const validSignature =
-      verifyWebhookSignature(
-        req.body,
-        timestamp,
-        signature
-      );
+    const validSignature = verifyWebhookSignature(
+      req.body,
+      timestamp,
+      signature
+    );
 
     if (!validSignature) {
+      console.error(
+        "[CASHFREE WEBHOOK] Invalid signature."
+      );
+
       return res.status(401).json({
         success: false,
-        message:
-          'Invalid webhook signature'
+        message: "Invalid webhook signature.",
       });
     }
 
@@ -815,13 +980,12 @@ exports.webhook = asyncHandler(
 
     try {
       event = JSON.parse(
-        req.body.toString('utf8')
+        req.body.toString("utf8")
       );
     } catch {
       return res.status(400).json({
         success: false,
-        message:
-          'Invalid webhook JSON'
+        message: "Invalid webhook JSON.",
       });
     }
 
@@ -829,33 +993,33 @@ exports.webhook = asyncHandler(
       event?.data?.order?.order_id;
 
     if (
-      typeof cashfreeOrderId !==
-        'string'
+      typeof cashfreeOrderId !== "string" ||
+      !cashfreeOrderId
     ) {
       return res.status(400).json({
         success: false,
-        message:
-          'Cashfree order ID missing'
+        message: "Cashfree order ID missing.",
       });
     }
 
     const payment = await Payment.findOne({
       where: {
-        provider: 'CASHFREE',
-        cashfreeOrderId
-      }
+        provider: "CASHFREE",
+        cashfreeOrderId,
+      },
     });
 
     if (!payment) {
-      // Unknown order: do not update anything.
       console.error(
-        'Cashfree webhook order not found'
+        "[CASHFREE WEBHOOK] Payment record not found:",
+        cashfreeOrderId
       );
 
-      return res.status(404).json({
-        success: false,
-        message:
-          'Payment record not found'
+      // Acknowledge unknown/stale events without
+      // modifying any order.
+      return res.status(200).json({
+        success: true,
+        message: "Unknown payment event ignored.",
       });
     }
 
@@ -865,29 +1029,39 @@ exports.webhook = asyncHandler(
 
     if (
       !order ||
-      order.paymentMethod !== 'CASHFREE'
+      order.paymentMethod !== "CASHFREE"
     ) {
-      return res.status(404).json({
-        success: false,
-        message:
-          'Cashfree order not found'
+      return res.status(200).json({
+        success: true,
+        message: "Invalid order event ignored.",
       });
     }
 
-    // Never mark an order PAID solely
-    // from the webhook JSON.
-    //
-    // Query Cashfree's API for its
-    // authoritative order status.
-    const updatedOrder =
-      await syncCashfreeOrder(order.id);
+    // Do not trust webhook success JSON alone.
+    // Verify the actual order through Cashfree API.
+    try {
+      const updatedOrder = await syncCashfreeOrder(
+        order.id
+      );
 
-    return res.status(200).json({
-      success: true,
-      message: 'Webhook processed',
-      orderId: updatedOrder.id,
-      paymentStatus:
-        updatedOrder.paymentStatus
-    });
+      return res.status(200).json({
+        success: true,
+        message: "Webhook processed.",
+        orderId: updatedOrder.id,
+        paymentStatus: updatedOrder.paymentStatus,
+      });
+
+    } catch (error) {
+      console.error(
+        "[CASHFREE WEBHOOK] Processing error:",
+        error.message
+      );
+
+      // Return an error so Cashfree can retry delivery.
+      return res.status(500).json({
+        success: false,
+        message: "Webhook processing failed.",
+      });
+    }
   }
 );

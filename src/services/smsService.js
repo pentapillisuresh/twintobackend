@@ -1,189 +1,97 @@
 
-const SMS_TIMEOUT_MS = 10000;
+const sendOtpSms = async (mobile, otp) => {
+  const apiUrl = process.env.SMS_API_URL;
+  const username = process.env.SMS_API_USER;
+  const password = process.env.SMS_API_PASS;
 
-function getSmsConfig() {
-  const {
-    SMS_API_URL,
-    SMS_API_USER,
-    SMS_API_PASS,
-    SMS_SENDER_ID,
-    SMS_SUCCESS_PATTERN,
-    SMS_PRIORITY,
-    SMS_STYPE,
-    SMS_DLT_TEMPLATE_ID,
-    SMS_DLT_ENTITY_ID,
-  } = process.env;
-
-  if (!SMS_API_URL || !SMS_API_USER || !SMS_API_PASS) {
-    throw new Error("SMS gateway not configured");
+  if (!apiUrl || !username || !password) {
+    throw new Error("SMS configuration missing");
   }
 
-  if (
-    SMS_API_PASS.startsWith("YOUR_") ||
-    SMS_API_PASS.startsWith("PASTE_")
-  ) {
+  const url = new URL(apiUrl);
+
+  // Use the exact HTTP endpoint supplied by the SMS provider.
+  if (url.protocol !== "http:") {
     throw new Error(
-      "SMS gateway password is still a placeholder"
+      "SMS_API_URL must match the provider's HTTP endpoint"
     );
   }
 
-  const url = new URL(SMS_API_URL);
+  const expiry = process.env.OTP_EXPIRES_MINUTES || 5;
 
-  if (url.protocol !== "https:") {
-    throw new Error(
-      "SMS gateway must use an HTTPS endpoint"
-    );
-  }
-
-  let successRegex;
-
-  try {
-    successRegex = new RegExp(
-      SMS_SUCCESS_PATTERN || "^S\\.[0-9]+$",
-      "i"
-    );
-  } catch {
-    throw new Error("Invalid SMS_SUCCESS_PATTERN");
-  }
-
-  return {
-    url,
-    username: SMS_API_USER,
-    password: SMS_API_PASS,
-    sender: SMS_SENDER_ID || "TWNTOO",
-    priority: SMS_PRIORITY || "ndnd",
-    stype: SMS_STYPE || "normal",
-    templateId: SMS_DLT_TEMPLATE_ID,
-    entityId: SMS_DLT_ENTITY_ID,
-    successRegex,
-  };
-}
-
-function maskMobile(mobile) {
-  const value = String(mobile || "");
-
-  return value.length >= 4
-    ? `******${value.slice(-4)}`
-    : "******";
-}
-
-async function sendOtpSms(mobile, otp) {
-  const config = getSmsConfig();
-
-  const url = new URL(config.url.toString());
-
-  url.searchParams.set("user", config.username);
-  url.searchParams.set("pass", config.password);
-  url.searchParams.set("sender", config.sender);
-  url.searchParams.set("phone", mobile);
-
-  const expiryMinutes = Number(
-    process.env.OTP_EXPIRES_MINUTES || 5
-  );
-
-  // This message must match the provider's
-  // approved DLT template exactly.
   const message =
-    "Welcome to TWINTO E COMMERCE! " +
-    `Your login OTP is ${otp}. ` +
-    `It is valid for ${expiryMinutes} minutes. ` +
+    `Welcome to TWINTO E COMMERCE! Your login OTP is ${otp}. ` +
+    `It is valid for ${expiry} minutes. ` +
     "Do not share this OTP with anyone. " +
     "Visit https://www.twinto.store/";
 
+  url.searchParams.set("user", username);
+  url.searchParams.set("pass", password);
+  url.searchParams.set("sender", process.env.SMS_SENDER_ID || "TWNTOO");
+  url.searchParams.set("phone", String(mobile));
   url.searchParams.set("text", message);
-  url.searchParams.set("priority", config.priority);
-  url.searchParams.set("stype", config.stype);
-
-  // Parameter names vary between SMS providers.
-  // Enable only after confirming your gateway's API.
-  if (config.templateId) {
-    url.searchParams.set(
-      "templateid",
-      config.templateId
-    );
-  }
-
-  if (config.entityId) {
-    url.searchParams.set(
-      "entityid",
-      config.entityId
-    );
-  }
+  url.searchParams.set("priority", process.env.SMS_PRIORITY || "ndnd");
+  url.searchParams.set("stype", process.env.SMS_STYPE || "normal");
 
   const controller = new AbortController();
 
-  const timeout = setTimeout(
-    () => controller.abort(),
-    SMS_TIMEOUT_MS
-  );
+  const timeout = setTimeout(() => {
+    controller.abort();
+  }, 20000);
 
   try {
-    console.log("[SMS] Sending OTP request", {
-      mobile: maskMobile(mobile),
-      gatewayHost: config.url.hostname,
-      sender: config.sender,
-      templateConfigured: Boolean(config.templateId),
+    console.log("[SMS] Sending OTP", {
+      host: url.hostname,
+      protocol: url.protocol,
+      mobile: `******${String(mobile).slice(-4)}`,
     });
 
     const response = await fetch(url.toString(), {
       method: "GET",
+      redirect: "follow",
       signal: controller.signal,
-      redirect: "error",
-      headers: {
-        Accept: "text/plain, application/json",
-      },
     });
 
-    const responseText = (
-      await response.text()
-    ).trim();
+    const responseText = (await response.text()).trim();
 
-    // Avoid printing the raw provider response:
-    // it may contain phone numbers or other secrets.
-    console.log("[SMS] Provider result", {
-      httpStatus: response.status,
-      responseLength: responseText.length,
-      acceptedFormat:
-        config.successRegex.test(responseText),
+    console.log("[SMS] Provider response:", {
+      status: response.status,
+      response: responseText.slice(0, 150),
     });
 
     if (!response.ok) {
+      throw new Error(`SMS provider HTTP ${response.status}`);
+    }
+
+    const successPattern = new RegExp(
+      process.env.SMS_SUCCESS_PATTERN || "^S\\.[0-9]+$",
+      "i"
+    );
+
+    if (!successPattern.test(responseText)) {
       throw new Error(
-        `SMS provider HTTP error: ${response.status}`
+        `SMS provider rejected or returned unexpected response: ${responseText.slice(0, 100)}`
       );
     }
 
-    if (!responseText) {
-      throw new Error(
-        "SMS provider returned an empty response"
-      );
-    }
-
-    if (!config.successRegex.test(responseText)) {
-      throw new Error(
-        "SMS provider response does not match configured success pattern"
-      );
-    }
-
-    console.log("[SMS] Provider accepted OTP request");
+    console.log("[SMS] OTP successfully accepted by provider");
 
     return {
-      accepted: true,
+      success: true,
+      message: "OTP sent successfully",
     };
+
   } catch (error) {
-    const message =
-      error.name === "AbortError"
-        ? "SMS gateway request timed out"
-        : error.message;
+    console.error("[SMS] Delivery failed:", {
+      message: error.message,
+      causeCode: error.cause?.code || null,
+    });
 
-    console.error("[SMS] Delivery failed:", message);
+    throw error;
 
-    throw new Error(message);
   } finally {
     clearTimeout(timeout);
   }
-}
-
-module.exports = {
-  sendOtpSms,
 };
+
+module.exports = { sendOtpSms };

@@ -574,12 +574,10 @@ exports.createOrder = asyncHandler(
           }
         );
 
-        // Do not create a duplicate order.
-        // Preserve the existing order and
-        // payment for manual reconciliation.
-        //
-        // A dedicated payment retry endpoint
-        // is still required.
+        // Important:
+        // The local order has already been saved.
+        // Do not ask the customer to create another order.
+        // Return the existing order ID so payment can be retried.
 
         const savedOrder =
           await Order.findByPk(
@@ -594,18 +592,16 @@ exports.createOrder = asyncHandler(
             }
           );
 
-        return res.status(502).json({
-          success: false,
-
-          message:
-            'Order created, but Cashfree checkout could not be started. Do not place another order.',
-
-          data: {
+        return ok(
+          res,
+          {
             order: savedOrder,
             cashfree: null,
             retryRequired: true
-          }
-        });
+          },
+          'Order created. Cashfree payment can be retried.',
+          201
+        );
       }
     }
 
@@ -763,8 +759,7 @@ exports.cancelMyOrder = asyncHandler(
       );
     }
 
-    // Confirm online payment before
-    // allowing cancellation.
+    // Verify online payment before cancellation.
     if (isOnlinePayment(row)) {
       row = await syncCashfreeOrder(
         row.id
@@ -931,15 +926,9 @@ exports.adminStats = asyncHandler(
 
     return ok(res, {
       totalOrders,
-
       totalCustomers,
-
-      totalSales:
-        Number(totalSales),
-
-      paidSales:
-        Number(paidSales),
-
+      totalSales: Number(totalSales),
+      paidSales: Number(paidSales),
       statusCounts
     });
   }
@@ -1216,8 +1205,8 @@ exports.updateOrderStatus = asyncHandler(
       );
     }
 
-    // Refresh Cashfree payment status
-    // before delivery or cancellation.
+    // Refresh Cashfree payment status before delivery
+    // or cancellation.
     if (
       isOnlinePayment(row) &&
       [
@@ -1233,16 +1222,10 @@ exports.updateOrderStatus = asyncHandler(
         );
     }
 
-    // FIX 1:
-    // Cashfree orders cannot be delivered
-    // unless payment is confirmed.
     if (
-      nextStatus ===
-        'DELIVERED' &&
-      row.paymentMethod ===
-        'CASHFREE' &&
-      row.paymentStatus !==
-        'PAID'
+      nextStatus === 'DELIVERED' &&
+      row.paymentMethod === 'CASHFREE' &&
+      row.paymentStatus !== 'PAID'
     ) {
       return fail(
         res,
@@ -1251,12 +1234,9 @@ exports.updateOrderStatus = asyncHandler(
       );
     }
 
-    // Paid orders require refund handling.
     if (
-      nextStatus ===
-        'CANCELLED' &&
-      row.paymentStatus ===
-        'PAID'
+      nextStatus === 'CANCELLED' &&
+      row.paymentStatus === 'PAID'
     ) {
       return fail(
         res,
@@ -1285,13 +1265,10 @@ exports.updateOrderStatus = asyncHandler(
         }
 
         if (
-          locked.status !==
-            nextStatus &&
+          locked.status !== nextStatus &&
           !transitions[
             locked.status
-          ]?.includes(
-            nextStatus
-          )
+          ]?.includes(nextStatus)
         ) {
           throw httpError(
             `Cannot change ${locked.status} to ${nextStatus}`,
@@ -1299,16 +1276,10 @@ exports.updateOrderStatus = asyncHandler(
           );
         }
 
-        // FIX 2:
-        // Recheck Cashfree payment status
-        // inside the database transaction.
         if (
-          nextStatus ===
-            'DELIVERED' &&
-          locked.paymentMethod ===
-            'CASHFREE' &&
-          locked.paymentStatus !==
-            'PAID'
+          nextStatus === 'DELIVERED' &&
+          locked.paymentMethod === 'CASHFREE' &&
+          locked.paymentStatus !== 'PAID'
         ) {
           throw httpError(
             'Cannot deliver unpaid online order',
@@ -1317,10 +1288,8 @@ exports.updateOrderStatus = asyncHandler(
         }
 
         if (
-          nextStatus ===
-            'CANCELLED' &&
-          locked.paymentStatus ===
-            'PAID'
+          nextStatus === 'CANCELLED' &&
+          locked.paymentStatus === 'PAID'
         ) {
           throw httpError(
             'Paid order requires refund workflow',
@@ -1328,11 +1297,8 @@ exports.updateOrderStatus = asyncHandler(
           );
         }
 
-        // No duplicate history when
-        // status remains unchanged.
         if (
-          locked.status ===
-          nextStatus
+          locked.status === nextStatus
         ) {
           return;
         }
@@ -1341,19 +1307,15 @@ exports.updateOrderStatus = asyncHandler(
           {
             status: nextStatus,
 
-            ...(nextStatus ===
-            'DELIVERED'
+            ...(nextStatus === 'DELIVERED'
               ? {
-                  deliveredAt:
-                    new Date()
+                  deliveredAt: new Date()
                 }
               : {}),
 
-            ...(nextStatus ===
-            'CANCELLED'
+            ...(nextStatus === 'CANCELLED'
               ? {
-                  cancelledAt:
-                    new Date()
+                  cancelledAt: new Date()
                 }
               : {})
           },
@@ -1362,17 +1324,10 @@ exports.updateOrderStatus = asyncHandler(
 
         await History.create(
           {
-            orderId:
-              locked.id,
-
-            status:
-              nextStatus,
-
-            note:
-              `Updated by admin ${req.user.id}`,
-
-            changedBy:
-              req.user.id
+            orderId: locked.id,
+            status: nextStatus,
+            note: `Updated by admin ${req.user.id}`,
+            changedBy: req.user.id
           },
           { transaction }
         );
@@ -1433,10 +1388,7 @@ exports.assignDeliveryPerson = asyncHandler(
 
     if (
       !name ||
-      mobile.replace(
-        /\D/g,
-        ''
-      ).length < 10
+      mobile.replace(/\D/g, '').length < 10
     ) {
       return fail(
         res,
@@ -1493,7 +1445,176 @@ exports.assignDeliveryPerson = asyncHandler(
 );
 
 // ==========================================
-// 13. WHATSAPP ORDER SHARING
+// 13. RETRY CASHFREE PAYMENT
+// POST /orders/:id/retry-payment
+// ==========================================
+
+exports.retryCashfreePayment = asyncHandler(
+  async (req, res) => {
+    const orderId = validId(req.params.id);
+
+    if (!orderId) {
+      return fail(
+        res,
+        'Invalid order ID',
+        400
+      );
+    }
+
+    const order = await Order.findOne({
+      where: {
+        id: orderId,
+        userId: req.user.id,
+        paymentMethod: 'CASHFREE'
+      }
+    });
+
+    if (!order) {
+      return fail(
+        res,
+        'Cashfree order not found',
+        404
+      );
+    }
+
+    if (order.status === 'CANCELLED') {
+      return fail(
+        res,
+        'Cancelled orders cannot be paid',
+        409
+      );
+    }
+
+    if (order.paymentStatus === 'PAID') {
+      return ok(
+        res,
+        {
+          order,
+          orderId: order.id,
+          paymentStatus: 'PAID',
+          isPaid: true,
+          cashfree: null
+        },
+        'Order is already paid'
+      );
+    }
+
+    const payment = await Payment.findOne({
+      where: {
+        orderId: order.id,
+        provider: 'CASHFREE'
+      }
+    });
+
+    if (!payment) {
+      return fail(
+        res,
+        'Cashfree payment record not found',
+        404
+      );
+    }
+
+    // Verify only when a real Cashfree reference exists.
+    if (payment.cashfreeOrderId) {
+      try {
+        const verifiedOrder =
+          await syncCashfreeOrder(order.id);
+
+        if (
+          verifiedOrder.paymentStatus === 'PAID'
+        ) {
+          return ok(
+            res,
+            {
+              order: verifiedOrder,
+              orderId: verifiedOrder.id,
+              paymentStatus: 'PAID',
+              isPaid: true,
+              cashfree: null
+            },
+            'Order is already paid'
+          );
+        }
+      } catch (error) {
+        if (
+          error.cashfreeStatus === 404 &&
+          error.cashfreeCode === 'order_not_found'
+        ) {
+          console.warn(
+            '[RETRY PAYMENT] Clearing stale Cashfree order:',
+            payment.cashfreeOrderId
+          );
+
+          await payment.update({
+            cashfreeOrderId: null,
+            cashfreeSessionId: null,
+            status: 'PENDING'
+          });
+        } else {
+          throw error;
+        }
+      }
+    }
+
+    const latestOrder =
+      await Order.findByPk(orderId);
+
+    if (
+      !latestOrder ||
+      latestOrder.status === 'CANCELLED'
+    ) {
+      return fail(
+        res,
+        'Order is not available for payment',
+        409
+      );
+    }
+
+    const cashfree =
+      await createCashfreeSession(
+        latestOrder,
+        req.user
+      );
+
+    if (
+      !cashfree ||
+      !cashfree.paymentSessionId ||
+      !cashfree.cashfreeOrderId ||
+      !cashfree.environment
+    ) {
+      return fail(
+        res,
+        'Cashfree did not return complete payment session details',
+        502
+      );
+    }
+
+    return ok(
+      res,
+      {
+        order: latestOrder,
+        orderId: latestOrder.id,
+        paymentStatus: latestOrder.paymentStatus,
+        isPaid: false,
+
+        cashfree: {
+          paymentSessionId:
+            cashfree.paymentSessionId,
+
+          cashfreeOrderId:
+            cashfree.cashfreeOrderId,
+
+          environment:
+            cashfree.environment
+        }
+      },
+      'Cashfree payment session ready'
+    );
+  }
+);
+
+// ==========================================
+// 14. WHATSAPP ORDER SHARING
 // ==========================================
 
 exports.whatsappOrder = asyncHandler(

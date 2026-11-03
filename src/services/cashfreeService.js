@@ -1,101 +1,124 @@
 
-const crypto = require('crypto');
-const { Order, Payment, db } = require('../models');
+const crypto = require("crypto");
+const { Op } = require("sequelize");
 
-// ==========================================
+const { Order, Payment, db } = require("../models");
+
+// =====================================================
 // 1. CASHFREE ENVIRONMENT
-// ==========================================
+// =====================================================
 
-const env = () =>
-  process.env.CASHFREE_ENV === 'production'
-    ? 'production'
-    : 'sandbox';
+const env = () => {
+  return String(process.env.CASHFREE_ENV || "sandbox").toLowerCase() ===
+    "production"
+    ? "production"
+    : "sandbox";
+};
 
-const baseUrl = () =>
-  env() === 'production'
-    ? 'https://api.cashfree.com/pg'
-    : 'https://sandbox.cashfree.com/pg';
+const baseUrl = () => {
+  return env() === "production"
+    ? "https://api.cashfree.com/pg"
+    : "https://sandbox.cashfree.com/pg";
+};
 
-const apiPrefix = () =>
-  process.env.API_PREFIX || '/api/v1';
+const apiPrefix = () => {
+  return process.env.API_PREFIX || "/api/v1";
+};
 
-// ==========================================
+// =====================================================
 // 2. PUBLIC BACKEND URL
-// ==========================================
+// =====================================================
 
 function publicBase() {
-  const value = String(
-    process.env.PUBLIC_BACKEND_URL || ''
-  ).replace(/\/$/, '');
+  const value = String(process.env.PUBLIC_BACKEND_URL || "")
+    .trim()
+    .replace(/\/+$/, "");
 
-  if (!/^https:\/\/[^/]+/i.test(value)) {
+  if (!/^https:\/\/[^/]+$/i.test(value)) {
     throw new Error(
-      'PUBLIC_BACKEND_URL must be a public HTTPS address'
+      "PUBLIC_BACKEND_URL must be a public HTTPS URL. Use ngrok for local development."
     );
   }
 
   return value;
 }
 
-// ==========================================
+// =====================================================
 // 3. CASHFREE API REQUEST
-// ==========================================
+// =====================================================
 
-async function cashfreeRequest(
-  path,
-  { method = 'GET', body } = {}
-) {
-  if (
-    !process.env.CASHFREE_APP_ID ||
-    !process.env.CASHFREE_SECRET_KEY
-  ) {
-    throw new Error(
-      'Cashfree credentials not configured'
-    );
+async function cashfreeRequest(path, { method = "GET", body } = {}) {
+  const appId = process.env.CASHFREE_APP_ID;
+  const secretKey = process.env.CASHFREE_SECRET_KEY;
+
+  if (!appId || !secretKey) {
+    throw new Error("Cashfree credentials are not configured.");
   }
 
-  const response = await fetch(
-    `${baseUrl()}${path}`,
-    {
+  const url = `${baseUrl()}${path}`;
+
+  console.log("[CASHFREE] API Request:", {
+    method,
+    environment: env(),
+    endpoint: path,
+  });
+
+  let response;
+
+  try {
+    response = await fetch(url, {
       method,
       headers: {
-        'Content-Type': 'application/json',
-        'x-client-id': process.env.CASHFREE_APP_ID,
-        'x-client-secret':
-          process.env.CASHFREE_SECRET_KEY,
-        'x-api-version':
-          process.env.CASHFREE_API_VERSION ||
-          '2025-01-01'
+        "Content-Type": "application/json",
+        "x-client-id": appId,
+        "x-client-secret": secretKey,
+        "x-api-version": process.env.CASHFREE_API_VERSION || "2025-01-01",
       },
-      ...(body === undefined
-        ? {}
-        : { body: JSON.stringify(body) }),
-      signal: AbortSignal.timeout(12000)
-    }
-  );
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+      signal: AbortSignal.timeout(20000),
+    });
+  } catch (error) {
+    console.error("[CASHFREE] Network error:", error.message);
+
+    const networkError = new Error(
+      "Unable to connect to Cashfree. Please try again."
+    );
+
+    networkError.status = 502;
+    networkError.code = "CASHFREE_NETWORK_ERROR";
+
+    throw networkError;
+  }
 
   const raw = await response.text();
 
-  let data = {};
+  let data;
 
   try {
-    data = JSON.parse(raw);
+    data = raw ? JSON.parse(raw) : {};
   } catch {
-    // Cashfree returned a non-JSON response.
+    data = { message: raw };
   }
 
   if (!response.ok) {
+    console.error("[CASHFREE] API Error:", {
+      status: response.status,
+      code: data.code,
+      message: data.message,
+      environment: env(),
+      endpoint: path,
+    });
+
     const error = new Error(
-      `Cashfree API request failed (${response.status})`
+      data.message ||
+        data.type ||
+        `Cashfree API failed with status ${response.status}`
     );
 
     error.status = 502;
-
-    console.error(
-      'Cashfree API error:',
-      response.status,
-      data.message || data.type || 'Unknown error'
-    );
+    error.cashfreeStatus = response.status;
+    error.cashfreeCode = data.code;
+    error.cashfreeResponse = data;
 
     throw error;
   }
@@ -103,312 +126,392 @@ async function cashfreeRequest(
   return data;
 }
 
-// ==========================================
+// =====================================================
 // 4. SIGN CHECKOUT URL
-// ==========================================
+// =====================================================
 
 function signCheckout(orderId, expires) {
-  const secret =
-    process.env.CASHFREE_CHECKOUT_SECRET;
+  const secret = process.env.CASHFREE_CHECKOUT_SECRET;
 
   if (!secret || secret.length < 32) {
     throw new Error(
-      'CASHFREE_CHECKOUT_SECRET is not configured'
+      "CASHFREE_CHECKOUT_SECRET must contain at least 32 characters."
     );
   }
 
   return crypto
-    .createHmac('sha256', secret)
+    .createHmac("sha256", secret)
     .update(`${orderId}:${expires}`)
-    .digest('hex');
+    .digest("hex");
 }
 
-// ==========================================
+// =====================================================
 // 5. GENERATE CHECKOUT URL
-// ==========================================
+// =====================================================
 
 function checkoutUrl(orderId) {
-  const expires =
-    Date.now() + 15 * 60 * 1000;
+  const expires = Date.now() + 15 * 60 * 1000;
+  const signature = signCheckout(orderId, expires);
 
-  return (
-    `${publicBase()}` +
-    `${apiPrefix()}` +
-    `/payments/checkout/${orderId}` +
-    `?expires=${expires}` +
-    `&sig=${signCheckout(orderId, expires)}`
+  const url = new URL(
+    `${publicBase()}${apiPrefix()}/payments/checkout/${orderId}`
   );
+
+  url.searchParams.set("expires", String(expires));
+  url.searchParams.set("sig", signature);
+
+  return url.toString();
 }
 
-// ==========================================
+// =====================================================
 // 6. VALIDATE CHECKOUT SIGNATURE
-// ==========================================
+// =====================================================
 
-function validCheckout(
-  orderId,
-  expires,
-  signature
-) {
+function validCheckout(orderId, expires, signature) {
   const expiry = Number(expires);
 
   if (
     !Number.isSafeInteger(expiry) ||
-    expiry < Date.now() ||
+    expiry <= Date.now() ||
     expiry > Date.now() + 16 * 60 * 1000
   ) {
     return false;
   }
 
-  if (
-    !/^[a-f0-9]{64}$/i.test(
-      String(signature || '')
-    )
-  ) {
+  if (!/^[a-f0-9]{64}$/i.test(String(signature || ""))) {
     return false;
   }
 
-  const expected = Buffer.from(
-    signCheckout(orderId, expires),
-    'hex'
-  );
+  try {
+    const expected = Buffer.from(signCheckout(orderId, expires), "hex");
+    const actual = Buffer.from(signature, "hex");
 
-  const actual = Buffer.from(
-    signature,
-    'hex'
-  );
-
-  return crypto.timingSafeEqual(
-    expected,
-    actual
-  );
+    return (
+      expected.length === actual.length &&
+      crypto.timingSafeEqual(expected, actual)
+    );
+  } catch {
+    return false;
+  }
 }
 
-// ==========================================
+// =====================================================
 // 7. CREATE CASHFREE PAYMENT SESSION
-// ==========================================
+// =====================================================
 
-async function createCashfreeSession(
-  order,
-  user
-) {
-  if (order.paymentMethod !== 'CASHFREE') {
+async function createCashfreeSession(order, user) {
+  if (order.paymentMethod !== "CASHFREE") {
+    throw new Error("Not a Cashfree order.");
+  }
+
+  if (!user?.id || !user?.mobile) {
     throw new Error(
-      'Not a Cashfree order'
+      "Customer ID and mobile number are required for Cashfree."
     );
+  }
+
+  if (order.paymentStatus === "PAID") {
+    throw new Error("This order is already paid.");
   }
 
   const payment = await Payment.findOne({
     where: {
       orderId: order.id,
-      provider: 'CASHFREE'
-    }
+      provider: "CASHFREE",
+    },
   });
 
   if (!payment) {
-    throw new Error(
-      'Cashfree payment record missing'
-    );
+    throw new Error("Cashfree payment record not found.");
   }
 
-  // Reuse an existing session.
-  if (
-    payment.cashfreeSessionId &&
-    payment.cashfreeOrderId
-  ) {
-    return {
-      paymentSessionId:
-        payment.cashfreeSessionId,
-      checkoutUrl: checkoutUrl(order.id),
-      environment: env()
-    };
-  }
+  const backendUrl = publicBase();
+  const callbackBase = `${backendUrl}${apiPrefix()}`;
 
-  const result = await cashfreeRequest(
-    '/orders',
-    {
-      method: 'POST',
-      body: {
-        order_id: `twinto_${order.id}`,
-        order_amount: Number(order.total),
-        order_currency: 'INR',
+  // ---------------------------------------------------
+  // REUSE ONLY A VALID ACTIVE CASHFREE SESSION
+  // ---------------------------------------------------
 
-        customer_details: {
-          customer_id: String(user.id),
-          customer_phone: String(user.mobile),
+  if (payment.cashfreeOrderId && payment.cashfreeSessionId) {
+    try {
+      const existingOrder = await cashfreeRequest(
+        `/orders/${encodeURIComponent(payment.cashfreeOrderId)}`
+      );
 
-          ...(user.email
-            ? { customer_email: user.email }
-            : {})
-        },
+      if (existingOrder.order_id !== payment.cashfreeOrderId) {
+        throw new Error("Cashfree order ID mismatch.");
+      }
 
-        order_meta: {
-          return_url:
-            `${publicBase()}` +
-            `${apiPrefix()}` +
-            `/payments/return?order_id=${order.id}`,
+      const existingStatus = String(
+        existingOrder.order_status || ""
+      ).toUpperCase();
 
-          notify_url:
-            `${publicBase()}` +
-            `${apiPrefix()}` +
-            '/payments/webhook'
-        },
+      if (existingStatus === "PAID") {
+        await syncCashfreeOrder(order.id);
+        throw new Error("This order is already paid.");
+      }
 
-        order_note:
-          `TWINTO ${order.orderNumber}`
+      if (existingStatus === "ACTIVE") {
+        console.log(
+          "[CASHFREE] Reusing validated ACTIVE session:",
+          payment.cashfreeOrderId
+        );
+
+        return {
+          paymentSessionId: payment.cashfreeSessionId,
+          cashfreeOrderId: payment.cashfreeOrderId,
+          checkoutUrl: null,
+          environment: env(),
+        };
+      }
+
+      console.warn("[CASHFREE] Existing order is not ACTIVE:", {
+        cashfreeOrderId: payment.cashfreeOrderId,
+        status: existingStatus,
+      });
+
+      await payment.update({
+        cashfreeOrderId: null,
+        cashfreeSessionId: null,
+        status: "PENDING",
+      });
+    } catch (error) {
+      if (
+        error.cashfreeStatus === 404 &&
+        error.cashfreeCode === "order_not_found"
+      ) {
+        console.warn(
+          "[CASHFREE] Stale order reference cleared:",
+          payment.cashfreeOrderId
+        );
+
+        await payment.update({
+          cashfreeOrderId: null,
+          cashfreeSessionId: null,
+          status: "PENDING",
+        });
+      } else {
+        throw error;
       }
     }
-  );
-
-  if (
-    !result.payment_session_id ||
-    !result.order_id
-  ) {
-    throw new Error(
-      'Cashfree did not return a payment session'
-    );
+  } else if (payment.cashfreeOrderId || payment.cashfreeSessionId) {
+    await payment.update({
+      cashfreeOrderId: null,
+      cashfreeSessionId: null,
+      status: "PENDING",
+    });
   }
+
+  // ---------------------------------------------------
+  // CREATE NEW CASHFREE ORDER
+  // ---------------------------------------------------
+
+  const cashfreeOrderReference =
+    `twinto_${order.id}_${Date.now()}_${crypto.randomBytes(3).toString("hex")}`;
+
+  const result = await cashfreeRequest("/orders", {
+    method: "POST",
+    body: {
+      order_id: cashfreeOrderReference,
+
+      order_amount: Number(Number(order.total).toFixed(2)),
+
+      order_currency: "INR",
+
+      customer_details: {
+        customer_id: String(user.id),
+        customer_phone: String(user.mobile),
+
+        ...(user.email
+          ? {
+              customer_email: user.email,
+            }
+          : {}),
+      },
+
+      order_meta: {
+        return_url: `${callbackBase}/payments/return?order_id=${order.id}`,
+        notify_url: `${callbackBase}/payments/webhook`,
+      },
+
+      order_note: `TWINTO ${order.orderNumber}`,
+    },
+  });
+
+  if (!result.payment_session_id || !result.order_id) {
+    console.error("[CASHFREE] Invalid session response:", result);
+
+    throw new Error("Cashfree did not return a valid payment session.");
+  }
+
+  if (result.order_id !== cashfreeOrderReference) {
+    throw new Error("Cashfree returned an unexpected order ID.");
+  }
+
+  // ---------------------------------------------------
+  // SAVE CASHFREE DETAILS IN MYSQL
+  // ---------------------------------------------------
 
   await payment.update({
     cashfreeOrderId: result.order_id,
-    cashfreeSessionId:
-      result.payment_session_id
+    cashfreeSessionId: result.payment_session_id,
+    status: "PENDING",
+  });
+
+  console.log("[CASHFREE] Payment session created:", {
+    internalOrderId: order.id,
+    cashfreeOrderId: result.order_id,
+    environment: env(),
   });
 
   return {
-    paymentSessionId:
-      result.payment_session_id,
-    checkoutUrl: checkoutUrl(order.id),
-    environment: env()
+    paymentSessionId: result.payment_session_id,
+    cashfreeOrderId: result.order_id,
+
+    // Native React Native SDK does not need a hosted checkout URL.
+    checkoutUrl: null,
+
+    environment: env(),
   };
 }
 
-// ==========================================
+// =====================================================
 // 8. VERIFY CASHFREE ORDER STATUS
-// ==========================================
+// =====================================================
 
 async function syncCashfreeOrder(orderId) {
-  const order = await Order.findByPk(
-    orderId
-  );
+  const order = await Order.findByPk(orderId);
 
-  if (
-    !order ||
-    order.paymentMethod !== 'CASHFREE'
-  ) {
+  if (!order) {
+    throw new Error("Order not found.");
+  }
+
+  if (order.paymentMethod !== "CASHFREE") {
     return order;
   }
 
   const payment = await Payment.findOne({
     where: {
       orderId,
-      provider: 'CASHFREE'
-    }
+      provider: "CASHFREE",
+    },
   });
 
-  if (!payment?.cashfreeOrderId) {
+  if (!payment) {
+    throw new Error("Cashfree payment record not found.");
+  }
+
+  // No Cashfree reference means session creation has not happened yet.
+  if (!payment.cashfreeOrderId) {
+    console.log("[CASHFREE] No Cashfree order to verify yet:", {
+      internalOrderId: orderId,
+      paymentStatus: order.paymentStatus,
+    });
+
     return order;
   }
 
-  // Fetch the payment status directly
-  // from Cashfree's server.
   const data = await cashfreeRequest(
-    `/orders/${encodeURIComponent(
-      payment.cashfreeOrderId
-    )}`
+    `/orders/${encodeURIComponent(payment.cashfreeOrderId)}`
   );
 
-  if (
-    data.order_id !==
-    payment.cashfreeOrderId
-  ) {
-    throw new Error(
-      'Cashfree order ID mismatch'
-    );
+  if (data.order_id !== payment.cashfreeOrderId) {
+    throw new Error("Cashfree order ID mismatch.");
   }
 
   if (
-    Number(data.order_amount) !==
-      Number(order.total) ||
-    data.order_currency !== 'INR'
+    Number(data.order_amount) !== Number(order.total) ||
+    data.order_currency !== "INR"
   ) {
-    throw new Error(
-      'Cashfree order amount or currency mismatch'
-    );
+    throw new Error("Cashfree amount or currency mismatch.");
   }
 
-  if (data.order_status === 'PAID') {
-    await db.transaction(
-      async transaction => {
-        const locked =
-          await Order.findByPk(
-            orderId,
-            {
-              transaction,
-              lock:
-                transaction.LOCK.UPDATE
-            }
-          );
+  const cashfreeStatus = String(data.order_status || "").toUpperCase();
 
-        if (
-          !locked ||
-          locked.paymentMethod !==
-            'CASHFREE'
-        ) {
-          throw new Error(
-            'Order changed during verification'
-          );
-        }
+  console.log("[CASHFREE] Payment status:", {
+    internalOrderId: orderId,
+    cashfreeOrderId: data.order_id,
+    status: cashfreeStatus,
+  });
 
-        if (
-          locked.status === 'CANCELLED'
-        ) {
-          // Requires refund or manual review.
-          console.error(
-            'Cashfree paid a cancelled order; refund review required:',
-            orderId
-          );
-        }
+  // ---------------------------------------------------
+  // UPDATE DATABASE TRANSACTIONALLY
+  // ---------------------------------------------------
 
-        if (
-          locked.paymentStatus !== 'PAID'
-        ) {
-          await locked.update(
-            {
-              paymentStatus: 'PAID'
-            },
-            { transaction }
-          );
-        }
+  if (cashfreeStatus === "PAID") {
+    await db.transaction(async (transaction) => {
+      const lockedOrder = await Order.findByPk(orderId, {
+        transaction,
+        lock: transaction.LOCK.UPDATE,
+      });
 
-        await Payment.update(
+      if (
+        !lockedOrder ||
+        lockedOrder.paymentMethod !== "CASHFREE"
+      ) {
+        throw new Error(
+          "Order changed during payment verification."
+        );
+      }
+
+      if (lockedOrder.status === "CANCELLED") {
+        console.error(
+          "[CASHFREE] Paid cancelled order needs manual refund review:",
+          orderId
+        );
+      }
+
+      if (lockedOrder.paymentStatus !== "PAID") {
+        await lockedOrder.update(
           {
-            status: 'PAID'
+            paymentStatus: "PAID",
           },
           {
-            where: {
-              id: payment.id
-            },
-            transaction
+            transaction,
           }
         );
       }
-    );
+
+      await Payment.update(
+        {
+          status: "PAID",
+        },
+        {
+          where: {
+            id: payment.id,
+          },
+          transaction,
+        }
+      );
+    });
+  } else if (cashfreeStatus === "EXPIRED") {
+    await db.transaction(async (transaction) => {
+      await Payment.update(
+        {
+          status: "FAILED",
+        },
+        {
+          where: {
+            id: payment.id,
+            status: {
+              [Op.ne]: "PAID",
+            },
+          },
+          transaction,
+        }
+      );
+    });
   }
 
   return Order.findByPk(orderId);
 }
 
-// ==========================================
+// =====================================================
 // 9. VERIFY CASHFREE WEBHOOK SIGNATURE
-// ==========================================
+// =====================================================
 
-function verifyWebhookSignature(
-  rawBody,
-  timestamp,
-  signature
-) {
-  const secret =
-    process.env.CASHFREE_SECRET_KEY;
+function verifyWebhookSignature(rawBody, timestamp, signature) {
+  const secret = process.env.CASHFREE_SECRET_KEY;
 
   if (
     !secret ||
@@ -419,38 +522,37 @@ function verifyWebhookSignature(
     return false;
   }
 
-  const expected = crypto
-    .createHmac('sha256', secret)
-    .update(
-      Buffer.concat([
-        Buffer.from(
-          String(timestamp),
-          'utf8'
-        ),
-        rawBody
-      ])
-    )
-    .digest('base64');
+  try {
+    const expected = crypto
+      .createHmac("sha256", secret)
+      .update(
+        Buffer.concat([
+          Buffer.from(String(timestamp), "utf8"),
+          rawBody,
+        ])
+      )
+      .digest("base64");
 
-  const a = Buffer.from(
-    expected,
-    'utf8'
-  );
+    const expectedBuffer = Buffer.from(expected, "utf8");
+    const actualBuffer = Buffer.from(String(signature), "utf8");
 
-  const b = Buffer.from(
-    String(signature),
-    'utf8'
-  );
+    return (
+      expectedBuffer.length === actualBuffer.length &&
+      crypto.timingSafeEqual(expectedBuffer, actualBuffer)
+    );
+  } catch (error) {
+    console.error(
+      "[CASHFREE] Webhook signature error:",
+      error.message
+    );
 
-  return (
-    a.length === b.length &&
-    crypto.timingSafeEqual(a, b)
-  );
+    return false;
+  }
 }
 
-// ==========================================
+// =====================================================
 // 10. EXPORTS
-// ==========================================
+// =====================================================
 
 module.exports = {
   cashfreeRequest,
@@ -458,5 +560,5 @@ module.exports = {
   syncCashfreeOrder,
   validCheckout,
   verifyWebhookSignature,
-  env
+  env,
 };
