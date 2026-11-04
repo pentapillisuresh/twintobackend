@@ -1,4 +1,3 @@
-
 const { Op } = require('sequelize');
 const crypto = require('crypto');
 
@@ -15,7 +14,7 @@ const {
   User
 } = require('../models');
 
-const { getFees } = require('../services/feeService');
+const { getFees,calculateFees } = require('../services/feeService');
 
 const {
   createCashfreeSession,
@@ -264,8 +263,8 @@ exports.createOrder = asyncHandler(
           throw httpError('Cart is empty');
         }
 
-        let itemTotal = 0;
-        let count = 0;
+      let itemTotal = 0;
+let itemCount = 0;
 
         for (const item of items) {
           if (
@@ -307,45 +306,55 @@ exports.createOrder = asyncHandler(
             );
           }
 
-          itemTotal +=
-            price * Number(item.quantity);
+       itemTotal +=
+  price * Number(item.quantity);
 
-          count += Number(item.quantity);
+itemCount += Number(item.quantity);
         }
 
         itemTotal = money(itemTotal);
 
         // ------------------------------------
-        // Platform and delivery fees.
+        // Location-based fee calculation
         // ------------------------------------
-
-        const feeSettings = await getFees();
-
-        const platformFee = Number(
-          feeSettings.platformFee
+        const feeSettings = await getFees(
+          address.locationId,
+          transaction
         );
 
-        const deliveryFee =
-          feeSettings.freeDeliveryEnabled &&
-          count > 0 &&
-          count <=
-            Number(
-              feeSettings.freeDeliveryMaxItems
-            )
-            ? 0
-            : Number(
-                feeSettings.deliveryPartnerFee
-              );
+        const minimumOrder = Number(
+          feeSettings.minimumOrder
+        );
 
+        const calculatedFees = calculateFees(
+          feeSettings,
+          itemCount
+        );
+
+        const platformFee = calculatedFees.platformFee;
+        const deliveryFee = calculatedFees.deliveryCharge;
+
+        // Validate all fee settings before calculating the order total.
         if (
+          !Number.isFinite(minimumOrder) ||
+          minimumOrder < 0 ||
           !Number.isFinite(platformFee) ||
           platformFee < 0 ||
           !Number.isFinite(deliveryFee) ||
           deliveryFee < 0
         ) {
           throw httpError(
-            'Invalid delivery or platform fee',
+            'Invalid location fee configuration',
             500
+          );
+        }
+
+        // Minimum order is checked against product subtotal only.
+        // Platform fee, delivery charge, coupon and tip are excluded.
+        if (itemTotal < minimumOrder) {
+          throw httpError(
+            `Minimum order amount is ₹${minimumOrder}. Your cart total is ₹${itemTotal}. Please add ₹${money(minimumOrder - itemTotal)} more.`,
+            400
           );
         }
 

@@ -1,52 +1,40 @@
-const { Setting } = require("../models");
+
 const { ok, fail } = require("../utils/response");
 const { getFees } = require("../services/feeService");
 
 const asyncHandler = (fn) => (req, res, next) =>
   Promise.resolve(fn(req, res, next)).catch(next);
 
+// ==========================================
+// GET LOCATION-SPECIFIC FEE SETTINGS
+// GET /settings/fees?locationId=1
+// ==========================================
+
 exports.getFeeSettings = asyncHandler(async (req, res) => {
-  const settings = await getFees();
-  return ok(res, settings);
-});
+  const locationId = Number(req.query.locationId);
 
-exports.updateFeeSettings = asyncHandler(async (req, res) => {
-  const platformFee = Number(req.body.platformFee);
-  const deliveryPartnerFee = Number(req.body.deliveryPartnerFee);
-  const freeDeliveryMaxItems = Number(req.body.freeDeliveryMaxItems);
-
-  if (
-    !Number.isFinite(platformFee) ||
-    platformFee < 0 ||
-    !Number.isFinite(deliveryPartnerFee) ||
-    deliveryPartnerFee < 0 ||
-    !Number.isInteger(freeDeliveryMaxItems) ||
-    freeDeliveryMaxItems < 0 ||
-    freeDeliveryMaxItems > 100 ||
-    typeof req.body.freeDeliveryEnabled !== "boolean"
-  ) {
+  if (!Number.isSafeInteger(locationId) || locationId <= 0) {
     return fail(
       res,
-      "Enter valid non-negative fees, a boolean free-delivery setting, and an integer item limit from 0 to 100"
+      "A valid locationId is required to fetch fee settings",
+      400
     );
   }
 
-  const value = {
-    platformFee,
-    deliveryPartnerFee,
-    freeDeliveryEnabled: req.body.freeDeliveryEnabled,
-    freeDeliveryMaxItems,
-  };
+  const fees = await getFees(locationId);
 
-  const [row] = await Setting.findOrCreate({
-    where: { key: "feeSettings" },
-    defaults: {
-      key: "feeSettings",
-      value,
-    },
-  });
+  return ok(res, fees);
+});
 
-  await row.update({ value });
+// ==========================================
+// GLOBAL FEE UPDATES ARE DISABLED
+// Fees are now managed per location
+// ==========================================
 
-  return ok(res, value, "Fee settings updated");
+exports.updateFeeSettings = asyncHandler(async (req, res) => {
+  return fail(
+    res,
+    "Global fee settings are no longer supported. Update fees through Admin > Locations > Edit Location.",
+    410
+  );
 });
