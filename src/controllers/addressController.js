@@ -179,6 +179,8 @@ const locationAttributes = [
   'city',
   'state',
   'pincode',
+  'isActive',
+  'isAvailable',
   'platformFee',
   'minimumOrder',
   'deliveryCharge',

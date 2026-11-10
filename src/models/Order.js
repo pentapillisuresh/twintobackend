@@ -73,17 +73,16 @@ const Order = db.define('Order', {
     defaultValue: 'PENDING'
   },
 
-  status: {
-    type: DataTypes.ENUM(
-      'PLACED',
-      'CONFIRMED',
-      'PACKING',
-      'OUT_FOR_DELIVERY',
-      'DELIVERED',
-      'CANCELLED'
-    ),
-    defaultValue: 'PLACED'
-  },
+status: {
+  type: DataTypes.ENUM(
+    'PLACED',
+    'PREPARING',
+    'DELIVERED',
+    'CANCELLED'
+  ),
+  allowNull: false,
+  defaultValue: 'PLACED'
+},
 
   sendAddressToAdmin: {
     type: DataTypes.BOOLEAN,

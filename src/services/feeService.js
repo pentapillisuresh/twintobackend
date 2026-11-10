@@ -154,14 +154,14 @@ function calculateFees(fees, itemCount) {
   // Free delivery applies when the total quantity
   // is within the selected location's configured limit.
 
-  if (
-    settings.freeDeliveryEnabled &&
-    quantity > 0 &&
-    quantity <= settings.freeDeliveryMaxItems
-  ) {
-    deliveryCharge = 0;
-    freeDeliveryApplied = true;
-  }
+ if (
+  settings.freeDeliveryEnabled &&
+  quantity > 0 &&
+  quantity >= settings.freeDeliveryMaxItems
+) {
+  deliveryCharge = 0;
+  freeDeliveryApplied = true;
+}
 
   return {
     platformFee: settings.platformFee,

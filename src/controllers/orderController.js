@@ -1,5 +1,6 @@
-const { Op } = require('sequelize');
-const crypto = require('crypto');
+
+const { Op } = require("sequelize");
+const crypto = require("crypto");
 
 const {
   db,
@@ -11,38 +12,35 @@ const {
   OrderItem,
   Payment,
   History,
-  User
-} = require('../models');
+  User,
+} = require("../models");
 
-const { getFees,calculateFees } = require('../services/feeService');
+const {
+  getFees,
+  calculateFees,
+} = require("../services/feeService");
 
 const {
   createCashfreeSession,
-  syncCashfreeOrder
-} = require('../services/cashfreeService');
+  syncCashfreeOrder,
+} = require("../services/cashfreeService");
 
-const { ok, fail } = require('../utils/response');
+const { ok, fail } = require("../utils/response");
 
 // ==========================================
 // 1. COMMON HELPERS
 // ==========================================
 
-const asyncHandler = (fn) =>
-  (req, res, next) =>
-    Promise.resolve(fn(req, res, next)).catch(next);
+const asyncHandler = (fn) => (req, res, next) =>
+  Promise.resolve(fn(req, res, next)).catch(next);
 
 function httpError(message, status = 400) {
-  return Object.assign(new Error(message), {
-    status
-  });
+  return Object.assign(new Error(message), { status });
 }
 
 function validId(value) {
   const id = Number(value);
-
-  return Number.isSafeInteger(id) && id > 0
-    ? id
-    : null;
+  return Number.isSafeInteger(id) && id > 0 ? id : null;
 }
 
 function money(value) {
@@ -50,15 +48,108 @@ function money(value) {
 }
 
 function isOnlinePayment(order) {
-  return order.paymentMethod === 'CASHFREE';
+  return order.paymentMethod === "CASHFREE";
 }
 
 function newOrderNumber() {
   return (
-    'TW' +
+    "TW" +
     Date.now() +
-    crypto.randomBytes(4).toString('hex').toUpperCase()
+    crypto.randomBytes(4).toString("hex").toUpperCase()
   );
+}
+
+const DELIVERY_STATUSES = [
+  "PLACED",
+  "PREPARING",
+  "DELIVERED",
+];
+
+const ALL_STATUSES = [
+  ...DELIVERY_STATUSES,
+  "CANCELLED",
+];
+
+function isEligibleAdminOrder(order) {
+  return (
+    order.paymentMethod === "COD" ||
+    (
+      order.paymentMethod === "CASHFREE" &&
+      order.paymentStatus === "PAID"
+    )
+  );
+}
+
+// Converts ordered packs into total quantity.
+//
+// 1kg x 2   -> 2 kg
+// 500g x 3  -> 1.5 kg
+// 250g x 2  -> 500 g
+// 1L x 2    -> 2 L
+// piece x 3 -> 3 pieces
+
+function formatOrderedQuantity(unitValue, countValue) {
+  const count = Number(countValue) || 0;
+  const unit = String(unitValue || "").trim();
+
+  if (!unit) {
+    return `${count} ${count === 1 ? "item" : "items"}`;
+  }
+
+  const match = unit.match(
+    /^(\d+(?:\.\d+)?)\s*(kg|g|gm|ml|l|ltr|litre|liter|pcs|pc|piece|pieces|pack|packs)$/i
+  );
+
+  if (!match) {
+    const simpleUnit = unit.toLowerCase();
+
+    if (
+      ["piece", "pieces", "pc", "pcs"].includes(simpleUnit)
+    ) {
+      return `${count} ${count === 1 ? "piece" : "pieces"}`;
+    }
+
+    if (["pack", "packs"].includes(simpleUnit)) {
+      return `${count} ${count === 1 ? "pack" : "packs"}`;
+    }
+
+    return `${count} x ${unit}`;
+  }
+
+  const amount = Number(match[1]) * count;
+  const type = match[2].toLowerCase();
+
+  if (type === "kg") {
+    return `${amount} kg`;
+  }
+
+  if (type === "g" || type === "gm") {
+    return amount >= 1000
+      ? `${amount / 1000} kg`
+      : `${amount} g`;
+  }
+
+  if (type === "ml") {
+    return amount >= 1000
+      ? `${amount / 1000} L`
+      : `${amount} ml`;
+  }
+
+  if (["l", "ltr", "litre", "liter"].includes(type)) {
+    return `${amount} L`;
+  }
+
+  if (
+    ["pc", "pcs", "piece", "pieces"].includes(type)
+  ) {
+    return `${amount} ${amount === 1 ? "piece" : "pieces"}`;
+  }
+
+  if (["pack", "packs"].includes(type)) {
+    return `${amount} ${amount === 1 ? "pack" : "packs"}`;
+  }
+
+  return `${count} x ${unit}`;
 }
 
 // ==========================================
@@ -69,7 +160,7 @@ async function cartFor(userId, transaction) {
   const [cart] = await Cart.findOrCreate({
     where: { userId },
     defaults: { userId },
-    ...(transaction ? { transaction } : {})
+    ...(transaction ? { transaction } : {}),
   });
 
   return cart;
@@ -79,67 +170,58 @@ async function cartFor(userId, transaction) {
 // 3. COUPON DISCOUNT
 // ==========================================
 
-async function couponDiscount(
-  code,
-  itemTotal,
-  transaction
-) {
+async function couponDiscount(code, itemTotal, transaction) {
   if (!code) {
     return {
       discount: 0,
-      coupon: null
+      coupon: null,
     };
   }
 
-  const { Coupon } = require('../models');
+  const { Coupon } = require("../models");
 
   const coupon = await Coupon.findOne({
     where: {
       code: String(code).trim().toUpperCase(),
-      isActive: true
+      isActive: true,
     },
     transaction,
     lock: transaction
       ? transaction.LOCK.UPDATE
-      : undefined
+      : undefined,
   });
 
   if (!coupon) {
-    throw httpError('Invalid coupon');
+    throw httpError("Invalid coupon");
   }
 
   const now = new Date();
 
   if (coupon.startDate && now < coupon.startDate) {
-    throw httpError('Coupon is not active yet');
+    throw httpError("Coupon is not active yet");
   }
 
   if (coupon.endDate && now > coupon.endDate) {
-    throw httpError('Coupon has expired');
+    throw httpError("Coupon has expired");
   }
 
   if (
     coupon.usageLimit &&
-    Number(coupon.usedCount) >=
-      Number(coupon.usageLimit)
+    Number(coupon.usedCount) >= Number(coupon.usageLimit)
   ) {
-    throw httpError('Coupon usage limit reached');
+    throw httpError("Coupon usage limit reached");
   }
 
   if (
     itemTotal <
     Number(coupon.minimumOrderAmount || 0)
   ) {
-    throw httpError(
-      'Minimum order amount not reached'
-    );
+    throw httpError("Minimum order amount not reached");
   }
 
   let discount =
-    coupon.discountType === 'PERCENTAGE'
-      ? (itemTotal *
-          Number(coupon.discountValue)) /
-        100
+    coupon.discountType === "PERCENTAGE"
+      ? (itemTotal * Number(coupon.discountValue)) / 100
       : Number(coupon.discountValue);
 
   if (
@@ -153,17 +235,14 @@ async function couponDiscount(
   }
 
   if (!Number.isFinite(discount)) {
-    throw httpError('Invalid coupon discount');
+    throw httpError("Invalid coupon discount");
   }
 
   return {
     discount: money(
-      Math.min(
-        Math.max(discount, 0),
-        itemTotal
-      )
+      Math.min(Math.max(discount, 0), itemTotal)
     ),
-    coupon
+    coupon,
   };
 }
 
@@ -172,1194 +251,845 @@ async function couponDiscount(
 // COD + CASHFREE
 // ==========================================
 
-exports.createOrder = asyncHandler(
-  async (req, res) => {
-    const body = req.body || {};
+exports.createOrder = asyncHandler(async (req, res) => {
+  const body = req.body || {};
+  const paymentMethod = body.paymentMethod || "COD";
 
-    const paymentMethod =
-      body.paymentMethod || 'COD';
+  if (!["COD", "CASHFREE"].includes(paymentMethod)) {
+    return fail(
+      res,
+      "Invalid payment method. Use COD or CASHFREE.",
+      400
+    );
+  }
+
+  const addressId = validId(body.addressId);
+
+  if (!addressId) {
+    return fail(res, "Valid delivery address required", 400);
+  }
+
+  const tip = Number(body.tip || 0);
+
+  if (
+    !Number.isFinite(tip) ||
+    tip < 0 ||
+    tip > 10000
+  ) {
+    return fail(res, "Invalid tip", 400);
+  }
+
+  let createdOrder = null;
+
+  // Create local order records atomically.
+  await db.transaction(async (transaction) => {
+    const address = await Address.findOne({
+      where: {
+        id: addressId,
+        userId: req.user.id,
+        isActive: true,
+      },
+      transaction,
+    });
+
+    if (!address) {
+      throw httpError("Valid delivery address required");
+    }
+
+    const cart = await cartFor(
+      req.user.id,
+      transaction
+    );
+
+    const items = await CartItem.findAll({
+      where: { cartId: cart.id },
+      include: [
+        {
+          model: Product,
+          as: "product",
+        },
+      ],
+      transaction,
+      lock: transaction.LOCK.UPDATE,
+    });
+
+    if (!items.length) {
+      throw httpError("Cart is empty");
+    }
+
+    let itemTotal = 0;
+    let itemCount = 0;
+
+    for (const item of items) {
+      const quantity = Number(item.quantity);
+
+      if (
+        !Number.isSafeInteger(quantity) ||
+        quantity <= 0
+      ) {
+        throw httpError("Invalid cart item quantity");
+      }
+
+      if (
+        !item.product ||
+        !item.product.isActive ||
+        quantity > Number(item.product.stock)
+      ) {
+        throw httpError(
+          `Product unavailable or stock insufficient: ${
+            item.product?.name || ""
+          }`,
+          409
+        );
+      }
+
+      const price = Number(item.product.price);
+
+      if (
+        !Number.isFinite(price) ||
+        price < 0
+      ) {
+        throw httpError("Invalid product price", 409);
+      }
+
+      itemTotal += price * quantity;
+      itemCount += quantity;
+    }
+
+    itemTotal = money(itemTotal);
+
+    // Location-based fees.
+    const feeSettings = await getFees(
+      address.locationId,
+      transaction
+    );
+
+    const minimumOrder = Number(
+      feeSettings.minimumOrder
+    );
+
+    const calculatedFees = calculateFees(
+      feeSettings,
+      itemCount
+    );
+
+    const platformFee = calculatedFees.platformFee;
+    const deliveryFee = calculatedFees.deliveryCharge;
 
     if (
-      !['COD', 'CASHFREE'].includes(
-        paymentMethod
+      !Number.isFinite(minimumOrder) ||
+      minimumOrder < 0 ||
+      !Number.isFinite(platformFee) ||
+      platformFee < 0 ||
+      !Number.isFinite(deliveryFee) ||
+      deliveryFee < 0
+    ) {
+      throw httpError(
+        "Invalid location fee configuration",
+        500
+      );
+    }
+
+    if (itemTotal < minimumOrder) {
+      throw httpError(
+        `Minimum order amount is ₹${minimumOrder}. ` +
+        `Your cart total is ₹${itemTotal}. ` +
+        `Please add ₹${money(minimumOrder - itemTotal)} more.`,
+        400
+      );
+    }
+
+    // Coupon discount.
+    const couponResult = await couponDiscount(
+      body.couponCode,
+      itemTotal,
+      transaction
+    );
+
+    const total = money(
+      Math.max(
+        0,
+        itemTotal +
+          platformFee +
+          deliveryFee -
+          couponResult.discount +
+          tip
       )
-    ) {
-      return fail(
-        res,
-        'Invalid payment method. Use COD or CASHFREE.',
-        400
-      );
-    }
-
-    const addressId = validId(
-      body.addressId
     );
 
-    if (!addressId) {
-      return fail(
-        res,
-        'Valid delivery address required',
-        400
-      );
+    if (!Number.isFinite(total)) {
+      throw httpError("Invalid order total", 500);
     }
-
-    const tip = Number(body.tip || 0);
 
     if (
-      !Number.isFinite(tip) ||
-      tip < 0 ||
-      tip > 10000
+      paymentMethod === "CASHFREE" &&
+      total <= 0
     ) {
-      return fail(
-        res,
-        'Invalid tip',
-        400
+      throw httpError(
+        "Cashfree payment amount must be greater than zero"
       );
     }
 
-    let createdOrder = null;
-
-    // ----------------------------------------
-    // Create all local order records atomically.
-    // ----------------------------------------
-
-    await db.transaction(
-      async (transaction) => {
-        const address = await Address.findOne({
-          where: {
-            id: addressId,
-            userId: req.user.id,
-            isActive: true
-          },
-          transaction
-        });
-
-        if (!address) {
-          throw httpError(
-            'Valid delivery address required'
-          );
-        }
-
-        const cart = await cartFor(
-          req.user.id,
-          transaction
-        );
-
-        const items = await CartItem.findAll({
-          where: {
-            cartId: cart.id
-          },
-          include: [
-            {
-              model: Product,
-              as: 'product'
-            }
-          ],
-          transaction,
-          lock: transaction.LOCK.UPDATE
-        });
-
-        if (!items.length) {
-          throw httpError('Cart is empty');
-        }
-
-      let itemTotal = 0;
-let itemCount = 0;
-
-        for (const item of items) {
-          if (
-            !Number.isSafeInteger(
-              Number(item.quantity)
-            ) ||
-            Number(item.quantity) <= 0
-          ) {
-            throw httpError(
-              'Invalid cart item quantity'
-            );
-          }
-
-          if (
-            !item.product ||
-            !item.product.isActive ||
-            Number(item.quantity) >
-              Number(item.product.stock)
-          ) {
-            throw httpError(
-              `Product unavailable or stock insufficient: ${
-                item.product?.name || ''
-              }`,
-              409
-            );
-          }
-
-          const price = Number(
-            item.product.price
-          );
-
-          if (
-            !Number.isFinite(price) ||
-            price < 0
-          ) {
-            throw httpError(
-              'Invalid product price',
-              409
-            );
-          }
-
-       itemTotal +=
-  price * Number(item.quantity);
-
-itemCount += Number(item.quantity);
-        }
-
-        itemTotal = money(itemTotal);
-
-        // ------------------------------------
-        // Location-based fee calculation
-        // ------------------------------------
-        const feeSettings = await getFees(
-          address.locationId,
-          transaction
-        );
-
-        const minimumOrder = Number(
-          feeSettings.minimumOrder
-        );
-
-        const calculatedFees = calculateFees(
-          feeSettings,
-          itemCount
-        );
-
-        const platformFee = calculatedFees.platformFee;
-        const deliveryFee = calculatedFees.deliveryCharge;
-
-        // Validate all fee settings before calculating the order total.
-        if (
-          !Number.isFinite(minimumOrder) ||
-          minimumOrder < 0 ||
-          !Number.isFinite(platformFee) ||
-          platformFee < 0 ||
-          !Number.isFinite(deliveryFee) ||
-          deliveryFee < 0
-        ) {
-          throw httpError(
-            'Invalid location fee configuration',
-            500
-          );
-        }
-
-        // Minimum order is checked against product subtotal only.
-        // Platform fee, delivery charge, coupon and tip are excluded.
-        if (itemTotal < minimumOrder) {
-          throw httpError(
-            `Minimum order amount is ₹${minimumOrder}. Your cart total is ₹${itemTotal}. Please add ₹${money(minimumOrder - itemTotal)} more.`,
-            400
-          );
-        }
-
-        // ------------------------------------
-        // Coupon discount.
-        // ------------------------------------
-
-        const couponResult =
-          await couponDiscount(
-            body.couponCode,
-            itemTotal,
-            transaction
-          );
-
-        const total = money(
-          Math.max(
-            0,
-            itemTotal +
-              platformFee +
-              deliveryFee -
-              couponResult.discount +
-              tip
-          )
-        );
-
-        if (
-          !Number.isFinite(total)
-        ) {
-          throw httpError(
-            'Invalid order total',
-            500
-          );
-        }
-
-        if (
-          paymentMethod === 'CASHFREE' &&
-          total <= 0
-        ) {
-          throw httpError(
-            'Cashfree payment amount must be greater than zero'
-          );
-        }
-
-        // ------------------------------------
-        // Create order.
-        // ------------------------------------
-
-        createdOrder = await Order.create(
-          {
-            orderNumber:
-              newOrderNumber(),
-
-            userId: req.user.id,
-
-            addressId: address.id,
-
-            addressSnapshot:
-              address.toJSON(),
-
-            itemTotal,
-
-            platformFee:
-              money(platformFee),
-
-            deliveryPartnerFee:
-              money(deliveryFee),
-
-            discount:
-              couponResult.discount,
-
-            tip: money(tip),
-
-            total,
-
-            couponCode:
-              couponResult.coupon?.code ||
-              null,
-
-            paymentMethod,
-
-            paymentStatus: 'PENDING',
-
-            status: 'PLACED',
-
-            sendAddressToAdmin:
-              Boolean(
-                body.sendAddressToAdmin
-              ),
-
-            notes:
-              body.notes || null,
-
-            stockCommitted: false
-          },
-          { transaction }
-        );
-
-        // ------------------------------------
-        // Save order items.
-        // ------------------------------------
-
-        for (const item of items) {
-          const quantity = Number(
-            item.quantity
-          );
-
-          const price = Number(
-            item.product.price
-          );
-
-          await OrderItem.create(
-            {
-              orderId:
-                createdOrder.id,
-
-              productId:
-                item.product.id,
-
-              productName:
-                item.product.name,
-
-              productImage:
-                item.product.image,
-
-              price,
-
-              quantity,
-
-              subtotal: money(
-                price * quantity
-              )
-            },
-            { transaction }
-          );
-        }
-
-        // ------------------------------------
-        // Create order history.
-        // ------------------------------------
-
-        await History.create(
-          {
-            orderId:
-              createdOrder.id,
-
-            status: 'PLACED',
-
-            note:
-              'Order placed by customer',
-
-            changedBy:
-              req.user.id
-          },
-          { transaction }
-        );
-
-        // ------------------------------------
-        // Increment coupon usage.
-        // ------------------------------------
-
-        if (couponResult.coupon) {
-          await couponResult.coupon.increment(
-            'usedCount',
-            {
-              by: 1,
-              transaction
-            }
-          );
-        }
-
-        // ------------------------------------
-        // Create payment record.
-        // ------------------------------------
-
-        await Payment.create(
-          {
-            orderId:
-              createdOrder.id,
-
-            provider:
-              paymentMethod,
-
-            amount: total,
-
-            currency: 'INR',
-
-            status: 'PENDING'
-          },
-          { transaction }
-        );
-
-        // ------------------------------------
-        // Clear cart after order creation.
-        // ------------------------------------
-
-        await CartItem.destroy({
-          where: {
-            cartId: cart.id
-          },
-          transaction
-        });
-      }
+    // Create order.
+    createdOrder = await Order.create(
+      {
+        orderNumber: newOrderNumber(),
+        userId: req.user.id,
+        addressId: address.id,
+        addressSnapshot: address.toJSON(),
+        itemTotal,
+        platformFee: money(platformFee),
+        deliveryPartnerFee: money(deliveryFee),
+        discount: couponResult.discount,
+        tip: money(tip),
+        total,
+        couponCode: couponResult.coupon?.code || null,
+        paymentMethod,
+        paymentStatus: "PENDING",
+        status: "PLACED",
+        sendAddressToAdmin: Boolean(
+          body.sendAddressToAdmin
+        ),
+        notes: body.notes || null,
+        stockCommitted: false,
+      },
+      { transaction }
     );
 
-    // ========================================
-    // CREATE CASHFREE PAYMENT SESSION
-    // ========================================
+    // Save each order item with its product unit.
+    for (const item of items) {
+      const quantity = Number(item.quantity);
+      const price = Number(item.product.price);
 
-    let cashfree = null;
-
-    if (paymentMethod === 'CASHFREE') {
-      try {
-        cashfree =
-          await createCashfreeSession(
-            createdOrder,
-            req.user
-          );
-      } catch (error) {
-        console.error(
-          'Cashfree session creation failed:',
-          {
-            orderId:
-              createdOrder.id,
-            message:
-              error.message
-          }
-        );
-
-        // Important:
-        // The local order has already been saved.
-        // Do not ask the customer to create another order.
-        // Return the existing order ID so payment can be retried.
-
-        const savedOrder =
-          await Order.findByPk(
-            createdOrder.id,
-            {
-              include: [
-                {
-                  model: OrderItem,
-                  as: 'items'
-                }
-              ]
-            }
-          );
-
-        return ok(
-          res,
-          {
-            order: savedOrder,
-            cashfree: null,
-            retryRequired: true
-          },
-          'Order created. Cashfree payment can be retried.',
-          201
-        );
-      }
+      await OrderItem.create(
+        {
+          orderId: createdOrder.id,
+          productId: item.product.id,
+          productName: item.product.name,
+          productImage: item.product.image,
+          productUnit: item.product.unit || null,
+          price,
+          quantity,
+          subtotal: money(price * quantity),
+        },
+        { transaction }
+      );
     }
 
-    const savedOrder =
-      await Order.findByPk(
+    // Initial order history.
+    await History.create(
+      {
+        orderId: createdOrder.id,
+        status: "PLACED",
+        note: "Order placed by customer",
+        changedBy: req.user.id,
+      },
+      { transaction }
+    );
+
+    // Increment coupon usage.
+    if (couponResult.coupon) {
+      await couponResult.coupon.increment(
+        "usedCount",
+        {
+          by: 1,
+          transaction,
+        }
+      );
+    }
+
+    // Create payment record.
+    await Payment.create(
+      {
+        orderId: createdOrder.id,
+        provider: paymentMethod,
+        amount: total,
+        currency: "INR",
+        status: "PENDING",
+      },
+      { transaction }
+    );
+
+    // Clear cart after order creation.
+    await CartItem.destroy({
+      where: { cartId: cart.id },
+      transaction,
+    });
+  });
+
+  // Create Cashfree session after local order creation.
+  let cashfree = null;
+
+  if (paymentMethod === "CASHFREE") {
+    try {
+      cashfree = await createCashfreeSession(
+        createdOrder,
+        req.user
+      );
+    } catch (error) {
+      console.error(
+        "Cashfree session creation failed:",
+        {
+          orderId: createdOrder.id,
+          message: error.message,
+        }
+      );
+
+      // Local order exists. Return its ID for payment retry.
+      const savedOrder = await Order.findByPk(
         createdOrder.id,
         {
           include: [
             {
               model: OrderItem,
-              as: 'items'
-            }
-          ]
+              as: "items",
+            },
+          ],
         }
       );
 
-    return ok(
-      res,
-      {
-        order: savedOrder,
-        cashfree
-      },
-      'Order created',
-      201
-    );
+      return ok(
+        res,
+        {
+          order: savedOrder,
+          cashfree: null,
+          retryRequired: true,
+        },
+        "Order created. Cashfree payment can be retried.",
+        201
+      );
+    }
   }
-);
+
+  const savedOrder = await Order.findByPk(
+    createdOrder.id,
+    {
+      include: [
+        {
+          model: OrderItem,
+          as: "items",
+        },
+      ],
+    }
+  );
+
+  return ok(
+    res,
+    {
+      order: savedOrder,
+      cashfree,
+    },
+    "Order created",
+    201
+  );
+});
 
 // ==========================================
 // 5. LIST MY ORDERS
 // ==========================================
 
-exports.listMyOrders = asyncHandler(
-  async (req, res) => {
-    const orders = await Order.findAll({
-      where: {
-        userId: req.user.id
+exports.listMyOrders = asyncHandler(async (req, res) => {
+  const orders = await Order.findAll({
+    where: {
+      userId: req.user.id,
+    },
+    include: [
+      {
+        model: OrderItem,
+        as: "items",
       },
+    ],
+    order: [["createdAt", "DESC"]],
+  });
 
-      include: [
-        {
-          model: OrderItem,
-          as: 'items'
-        }
-      ],
-
-      order: [
-        ['createdAt', 'DESC']
-      ]
-    });
-
-    return ok(res, orders);
-  }
-);
+  return ok(res, orders);
+});
 
 // ==========================================
 // 6. GET MY ORDER DETAILS
 // ==========================================
 
-exports.getMyOrder = asyncHandler(
-  async (req, res) => {
-    const orderId = validId(
-      req.params.id
-    );
+exports.getMyOrder = asyncHandler(async (req, res) => {
+  const orderId = validId(req.params.id);
 
-    if (!orderId) {
-      return fail(
-        res,
-        'Invalid order ID',
-        400
-      );
-    }
-
-    const row = await Order.findOne({
-      where: {
-        id: orderId,
-        userId: req.user.id
-      },
-
-      include: [
-        {
-          model: OrderItem,
-          as: 'items'
-        },
-        {
-          model: Payment,
-          as: 'payments'
-        },
-        {
-          model: History,
-          as: 'history'
-        }
-      ]
-    });
-
-    if (!row) {
-      return fail(
-        res,
-        'Order not found',
-        404
-      );
-    }
-
-    const data = row.toJSON();
-
-    data.address =
-      data.addressSnapshot;
-
-    return ok(res, data);
+  if (!orderId) {
+    return fail(res, "Invalid order ID", 400);
   }
-);
+
+  const row = await Order.findOne({
+    where: {
+      id: orderId,
+      userId: req.user.id,
+    },
+    include: [
+      {
+        model: OrderItem,
+        as: "items",
+      },
+      {
+        model: Payment,
+        as: "payments",
+      },
+      {
+        model: History,
+        as: "history",
+      },
+    ],
+  });
+
+  if (!row) {
+    return fail(res, "Order not found", 404);
+  }
+
+  const data = row.toJSON();
+  data.address = data.addressSnapshot;
+
+  return ok(res, data);
+});
 
 // ==========================================
 // 7. CUSTOMER CANCEL ORDER
 // ==========================================
 
-exports.cancelMyOrder = asyncHandler(
-  async (req, res) => {
-    const orderId = validId(
-      req.params.id
-    );
+exports.cancelMyOrder = asyncHandler(async (req, res) => {
+  const orderId = validId(req.params.id);
 
-    if (!orderId) {
-      return fail(
-        res,
-        'Invalid order ID',
-        400
-      );
-    }
+  if (!orderId) {
+    return fail(res, "Invalid order ID", 400);
+  }
 
-    let row = await Order.findOne({
-      where: {
-        id: orderId,
-        userId: req.user.id
-      }
-    });
+  let row = await Order.findOne({
+    where: {
+      id: orderId,
+      userId: req.user.id,
+    },
+  });
 
-    if (!row) {
-      return fail(
-        res,
-        'Order not found',
-        404
-      );
-    }
+  if (!row) {
+    return fail(res, "Order not found", 404);
+  }
 
-    if (
-      !['PLACED', 'CONFIRMED'].includes(
-        row.status
-      )
-    ) {
-      return fail(
-        res,
-        'Order can no longer be cancelled',
-        409
-      );
-    }
-
-    // Verify online payment before cancellation.
-    if (isOnlinePayment(row)) {
-      row = await syncCashfreeOrder(
-        row.id
-      );
-    }
-
-    if (
-      row.paymentStatus === 'PAID'
-    ) {
-      return fail(
-        res,
-        'Paid order requires refund workflow',
-        409
-      );
-    }
-
-    await db.transaction(
-      async (transaction) => {
-        const locked =
-          await Order.findByPk(
-            orderId,
-            {
-              transaction,
-              lock:
-                transaction.LOCK.UPDATE
-            }
-          );
-
-        if (
-          !locked ||
-          locked.userId !==
-            req.user.id
-        ) {
-          throw httpError(
-            'Order not found',
-            404
-          );
-        }
-
-        if (
-          ![
-            'PLACED',
-            'CONFIRMED'
-          ].includes(
-            locked.status
-          )
-        ) {
-          throw httpError(
-            'Order can no longer be cancelled',
-            409
-          );
-        }
-
-        if (
-          locked.paymentStatus ===
-          'PAID'
-        ) {
-          throw httpError(
-            'Paid order requires refund workflow',
-            409
-          );
-        }
-
-        await locked.update(
-          {
-            status: 'CANCELLED',
-            cancelledAt:
-              new Date()
-          },
-          { transaction }
-        );
-
-        await History.create(
-          {
-            orderId:
-              locked.id,
-
-            status:
-              'CANCELLED',
-
-            note:
-              'Cancelled by customer',
-
-            changedBy:
-              req.user.id
-          },
-          { transaction }
-        );
-      }
-    );
-
-    const updated =
-      await Order.findByPk(
-        orderId
-      );
-
-    return ok(
+  // Customer cancellation only before preparation.
+  if (row.status !== "PLACED") {
+    return fail(
       res,
-      updated,
-      'Order cancelled'
+      "Order can no longer be cancelled",
+      409
     );
   }
-);
+
+  // Never cancel a verified paid order without a refund workflow.
+  // For unpaid Cashfree orders, check the provider only
+  // when a Cashfree reference exists.
+
+  if (
+    isOnlinePayment(row) &&
+    row.paymentStatus !== "PAID"
+  ) {
+    const payment = await Payment.findOne({
+      where: {
+        orderId: row.id,
+        provider: "CASHFREE",
+      },
+    });
+
+    if (payment?.cashfreeOrderId) {
+      row = await syncCashfreeOrder(row.id);
+    }
+  }
+
+  if (row.paymentStatus === "PAID") {
+    return fail(
+      res,
+      "Paid order requires refund workflow",
+      409
+    );
+  }
+
+  await db.transaction(async (transaction) => {
+    const locked = await Order.findByPk(
+      orderId,
+      {
+        transaction,
+        lock: transaction.LOCK.UPDATE,
+      }
+    );
+
+    if (
+      !locked ||
+      locked.userId !== req.user.id
+    ) {
+      throw httpError("Order not found", 404);
+    }
+
+    if (locked.status !== "PLACED") {
+      throw httpError(
+        "Order can no longer be cancelled",
+        409
+      );
+    }
+
+    if (locked.paymentStatus === "PAID") {
+      throw httpError(
+        "Paid order requires refund workflow",
+        409
+      );
+    }
+
+    await locked.update(
+      {
+        status: "CANCELLED",
+        cancelledAt: new Date(),
+      },
+      { transaction }
+    );
+
+    await History.create(
+      {
+        orderId: locked.id,
+        status: "CANCELLED",
+        note: "Cancelled by customer",
+        changedBy: req.user.id,
+      },
+      { transaction }
+    );
+  });
+
+  const updated = await Order.findByPk(orderId);
+
+  return ok(res, updated, "Order cancelled");
+});
 
 // ==========================================
 // 8. ADMIN STATISTICS
 // ==========================================
 
-exports.adminStats = asyncHandler(
-  async (req, res) => {
-    const totalOrders =
-      await Order.count();
+exports.adminStats = asyncHandler(async (req, res) => {
+  const totalOrders = await Order.count();
 
-    const totalCustomers =
-      await User.count({
-        where: {
-          role: 'user'
-        }
-      });
+  const totalCustomers = await User.count({
+    where: {
+      role: "user",
+    },
+  });
 
-    const totalSales =
-      (await Order.sum(
-        'total',
-        {
-          where: {
-            status: {
-              [Op.ne]:
-                'CANCELLED'
-            }
-          }
-        }
-      )) || 0;
+  const totalSales =
+    (await Order.sum("total", {
+      where: {
+        status: {
+          [Op.ne]: "CANCELLED",
+        },
+      },
+    })) || 0;
 
-    const paidSales =
-      (await Order.sum(
-        'total',
-        {
-          where: {
-            paymentStatus:
-              'PAID'
-          }
-        }
-      )) || 0;
+  const paidSales =
+    (await Order.sum("total", {
+      where: {
+        paymentStatus: "PAID",
+      },
+    })) || 0;
 
-    const statusCounts = {};
+  const statusCounts = {};
 
-    const statuses = [
-      'PLACED',
-      'CONFIRMED',
-      'PACKING',
-      'OUT_FOR_DELIVERY',
-      'DELIVERED',
-      'CANCELLED'
-    ];
-
-    for (const status of statuses) {
-      statusCounts[status] =
-        await Order.count({
-          where: {
-            status
-          }
-        });
-    }
-
-    return ok(res, {
-      totalOrders,
-      totalCustomers,
-      totalSales: Number(totalSales),
-      paidSales: Number(paidSales),
-      statusCounts
+  for (const status of ALL_STATUSES) {
+    statusCounts[status] = await Order.count({
+      where: { status },
     });
   }
-);
+
+  return ok(res, {
+    totalOrders,
+    totalCustomers,
+    totalSales: Number(totalSales),
+    paidSales: Number(paidSales),
+    statusCounts,
+  });
+});
 
 // ==========================================
 // 9. ADMIN ORDER LIST
+// COD + PAID CASHFREE
 // ==========================================
 
-exports.adminOrders = asyncHandler(
-  async (req, res) => {
-    const where = {};
+exports.adminOrders = asyncHandler(async (req, res) => {
+  const where = {
+    [Op.or]: [
+      {
+        paymentMethod: "COD",
+      },
+      {
+        paymentMethod: "CASHFREE",
+        paymentStatus: "PAID",
+      },
+    ],
+  };
 
-    const allowedStatuses = [
-      'PLACED',
-      'CONFIRMED',
-      'PACKING',
-      'OUT_FOR_DELIVERY',
-      'DELIVERED',
-      'CANCELLED'
-    ];
-
-    if (req.query.status) {
-      if (
-        !allowedStatuses.includes(
-          req.query.status
-        )
-      ) {
-        return fail(
-          res,
-          'Invalid order status',
-          400
-        );
-      }
-
-      where.status =
-        req.query.status;
+  if (req.query.status) {
+    if (!ALL_STATUSES.includes(req.query.status)) {
+      return fail(
+        res,
+        "Invalid order status",
+        400
+      );
     }
 
-    if (req.query.search) {
-      where.orderNumber = {
-        [Op.like]:
-          `%${String(
-            req.query.search
-          ).slice(0, 80)}%`
-      };
-    }
-
-    const requestedLimit =
-      Number(req.query.limit || 100);
-
-    const requestedOffset =
-      Number(req.query.offset || 0);
-
-    const limit =
-      Number.isSafeInteger(
-        requestedLimit
-      )
-        ? Math.min(
-            Math.max(
-              requestedLimit,
-              1
-            ),
-            200
-          )
-        : 100;
-
-    const offset =
-      Number.isSafeInteger(
-        requestedOffset
-      )
-        ? Math.max(
-            requestedOffset,
-            0
-          )
-        : 0;
-
-    const orders =
-      await Order.findAll({
-        where,
-        limit,
-        offset,
-
-        order: [
-          ['createdAt', 'DESC']
-        ],
-
-        include: [
-          {
-            model: User,
-            as: 'user',
-
-            attributes: [
-              'id',
-              'name',
-              'mobile',
-              'email'
-            ]
-          },
-          {
-            model: OrderItem,
-            as: 'items'
-          }
-        ]
-      });
-
-    return ok(res, {
-      orders,
-      limit,
-      offset
-    });
+    where.status = req.query.status;
   }
-);
+
+  if (req.query.search) {
+    where.orderNumber = {
+      [Op.like]:
+        `%${String(req.query.search).slice(0, 80)}%`,
+    };
+  }
+
+  const requestedLimit = Number(
+    req.query.limit || 100
+  );
+
+  const requestedOffset = Number(
+    req.query.offset || 0
+  );
+
+  const limit = Number.isSafeInteger(requestedLimit)
+    ? Math.min(Math.max(requestedLimit, 1), 200)
+    : 100;
+
+  const offset = Number.isSafeInteger(requestedOffset)
+    ? Math.max(requestedOffset, 0)
+    : 0;
+
+  const orders = await Order.findAll({
+    where,
+    limit,
+    offset,
+    order: [["createdAt", "DESC"]],
+    include: [
+      {
+        model: User,
+        as: "user",
+        attributes: [
+          "id",
+          "name",
+          "mobile",
+          "email",
+        ],
+      },
+      {
+        model: OrderItem,
+        as: "items",
+      },
+    ],
+  });
+
+  return ok(res, {
+    orders,
+    limit,
+    offset,
+  });
+});
 
 // ==========================================
 // 10. ADMIN ORDER DETAIL
 // ==========================================
 
-exports.adminOrderDetail = asyncHandler(
-  async (req, res) => {
-    const orderId = validId(
-      req.params.id
-    );
+exports.adminOrderDetail = asyncHandler(async (req, res) => {
+  const orderId = validId(req.params.id);
 
-    if (!orderId) {
-      return fail(
-        res,
-        'Invalid order ID',
-        400
-      );
-    }
-
-    const row =
-      await Order.findByPk(
-        orderId,
-        {
-          include: [
-            {
-              model: User,
-              as: 'user',
-
-              attributes: [
-                'id',
-                'name',
-                'mobile',
-                'email'
-              ]
-            },
-            {
-              model: OrderItem,
-              as: 'items'
-            },
-            {
-              model: Payment,
-              as: 'payments'
-            },
-            {
-              model: History,
-              as: 'history'
-            }
-          ]
-        }
-      );
-
-    if (!row) {
-      return fail(
-        res,
-        'Order not found',
-        404
-      );
-    }
-
-    const data = row.toJSON();
-
-    data.address =
-      data.addressSnapshot;
-
-    return ok(res, data);
+  if (!orderId) {
+    return fail(res, "Invalid order ID", 400);
   }
-);
+
+  const row = await Order.findByPk(orderId, {
+    include: [
+      {
+        model: User,
+        as: "user",
+        attributes: [
+          "id",
+          "name",
+          "mobile",
+          "email",
+        ],
+      },
+      {
+        model: OrderItem,
+        as: "items",
+      },
+      {
+        model: Payment,
+        as: "payments",
+      },
+      {
+        model: History,
+        as: "history",
+      },
+    ],
+  });
+
+  if (!row) {
+    return fail(res, "Order not found", 404);
+  }
+
+  const data = row.toJSON();
+  data.address = data.addressSnapshot;
+
+  return ok(res, data);
+});
 
 // ==========================================
 // 11. ADMIN UPDATE ORDER STATUS
+// DIRECT THREE-STATUS UPDATE
 // ==========================================
 
 exports.updateOrderStatus = asyncHandler(
   async (req, res) => {
-    const orderId = validId(
-      req.params.id
-    );
+    const orderId = validId(req.params.id);
 
     if (!orderId) {
+      return fail(res, "Invalid order ID", 400);
+    }
+
+    const nextStatus = req.body?.status;
+
+    if (!DELIVERY_STATUSES.includes(nextStatus)) {
       return fail(
         res,
-        'Invalid order ID',
+        "Invalid order status. Use PLACED, PREPARING or DELIVERED.",
         400
       );
     }
 
-    const allowed = [
-      'PLACED',
-      'CONFIRMED',
-      'PACKING',
-      'OUT_FOR_DELIVERY',
-      'DELIVERED',
-      'CANCELLED'
-    ];
-
-    const nextStatus =
-      req.body?.status;
-
-    if (
-      !allowed.includes(
-        nextStatus
-      )
-    ) {
-      return fail(
-        res,
-        'Invalid status',
-        400
-      );
-    }
-
-    const transitions = {
-      PLACED: [
-        'CONFIRMED',
-        'CANCELLED'
-      ],
-
-      CONFIRMED: [
-        'PACKING',
-        'CANCELLED'
-      ],
-
-      PACKING: [
-        'OUT_FOR_DELIVERY',
-        'CANCELLED'
-      ],
-
-      OUT_FOR_DELIVERY: [
-        'DELIVERED'
-      ],
-
-      DELIVERED: [],
-
-      CANCELLED: []
-    };
-
-    let row =
-      await Order.findByPk(
-        orderId
-      );
+    let row = await Order.findByPk(orderId);
 
     if (!row) {
-      return fail(
-        res,
-        'Order not found',
-        404
-      );
+      return fail(res, "Order not found", 404);
     }
 
-    if (
-      row.status !== nextStatus &&
-      !transitions[
-        row.status
-      ]?.includes(
-        nextStatus
-      )
-    ) {
+    if (row.status === "CANCELLED") {
       return fail(
         res,
-        `Cannot change ${row.status} to ${nextStatus}`,
+        "Cancelled orders cannot be updated",
         409
       );
     }
 
-    // Refresh Cashfree payment status before delivery
-    // or cancellation.
+    // Already-verified paid Cashfree orders
+    // do not require another Cashfree lookup.
+    //
+    // This assumes PAID is set only by trusted
+    // server-side Cashfree verification.
+
     if (
       isOnlinePayment(row) &&
-      [
-        'DELIVERED',
-        'CANCELLED'
-      ].includes(
-        nextStatus
-      )
+      row.paymentStatus !== "PAID"
     ) {
-      row =
-        await syncCashfreeOrder(
-          row.id
-        );
-    }
+      const payment = await Payment.findOne({
+        where: {
+          orderId: row.id,
+          provider: "CASHFREE",
+        },
+      });
 
-    if (
-      nextStatus === 'DELIVERED' &&
-      row.paymentMethod === 'CASHFREE' &&
-      row.paymentStatus !== 'PAID'
-    ) {
-      return fail(
-        res,
-        'Cannot deliver unpaid online order',
-        409
-      );
-    }
-
-    if (
-      nextStatus === 'CANCELLED' &&
-      row.paymentStatus === 'PAID'
-    ) {
-      return fail(
-        res,
-        'Paid order requires refund workflow',
-        409
-      );
-    }
-
-    await db.transaction(
-      async (transaction) => {
-        const locked =
-          await Order.findByPk(
-            orderId,
-            {
-              transaction,
-              lock:
-                transaction.LOCK.UPDATE
-            }
-          );
-
-        if (!locked) {
-          throw httpError(
-            'Order not found',
-            404
-          );
-        }
-
-        if (
-          locked.status !== nextStatus &&
-          !transitions[
-            locked.status
-          ]?.includes(nextStatus)
-        ) {
-          throw httpError(
-            `Cannot change ${locked.status} to ${nextStatus}`,
-            409
-          );
-        }
-
-        if (
-          nextStatus === 'DELIVERED' &&
-          locked.paymentMethod === 'CASHFREE' &&
-          locked.paymentStatus !== 'PAID'
-        ) {
-          throw httpError(
-            'Cannot deliver unpaid online order',
-            409
-          );
-        }
-
-        if (
-          nextStatus === 'CANCELLED' &&
-          locked.paymentStatus === 'PAID'
-        ) {
-          throw httpError(
-            'Paid order requires refund workflow',
-            409
-          );
-        }
-
-        if (
-          locked.status === nextStatus
-        ) {
-          return;
-        }
-
-        await locked.update(
-          {
-            status: nextStatus,
-
-            ...(nextStatus === 'DELIVERED'
-              ? {
-                  deliveredAt: new Date()
-                }
-              : {}),
-
-            ...(nextStatus === 'CANCELLED'
-              ? {
-                  cancelledAt: new Date()
-                }
-              : {})
-          },
-          { transaction }
-        );
-
-        await History.create(
-          {
-            orderId: locked.id,
-            status: nextStatus,
-            note: `Updated by admin ${req.user.id}`,
-            changedBy: req.user.id
-          },
-          { transaction }
-        );
+      if (payment?.cashfreeOrderId) {
+        row = await syncCashfreeOrder(row.id);
       }
-    );
+    }
 
-    const updatedOrder =
-      await Order.findByPk(
+    if (
+      isOnlinePayment(row) &&
+      row.paymentStatus !== "PAID"
+    ) {
+      return fail(
+        res,
+        "Online payment must be verified before updating order status",
+        409
+      );
+    }
+
+    if (!isEligibleAdminOrder(row)) {
+      return fail(
+        res,
+        "Only COD and paid Cashfree orders can be updated",
+        409
+      );
+    }
+
+    await db.transaction(async (transaction) => {
+      const locked = await Order.findByPk(
         orderId,
         {
-          include: [
-            {
-              model: OrderItem,
-              as: 'items'
-            }
-          ]
+          transaction,
+          lock: transaction.LOCK.UPDATE,
         }
       );
+
+      if (!locked) {
+        throw httpError("Order not found", 404);
+      }
+
+      if (locked.status === "CANCELLED") {
+        throw httpError(
+          "Cancelled orders cannot be updated",
+          409
+        );
+      }
+
+      if (!isEligibleAdminOrder(locked)) {
+        throw httpError(
+          "Order payment is not eligible for fulfilment",
+          409
+        );
+      }
+
+      // No sequential transition restriction.
+      // PLACED -> DELIVERED is allowed.
+      // DELIVERED -> PREPARING is allowed
+      // when correcting a mistaken status.
+
+      if (locked.status === nextStatus) {
+        return;
+      }
+
+      await locked.update(
+        {
+          status: nextStatus,
+          deliveredAt:
+            nextStatus === "DELIVERED"
+              ? new Date()
+              : null,
+          cancelledAt: null,
+        },
+        { transaction }
+      );
+
+      await History.create(
+        {
+          orderId: locked.id,
+          status: nextStatus,
+          note: `Updated by admin ${req.user.id}`,
+          changedBy: req.user.id,
+        },
+        { transaction }
+      );
+    });
+
+    const updatedOrder = await Order.findByPk(
+      orderId,
+      {
+        include: [
+          {
+            model: OrderItem,
+            as: "items",
+          },
+        ],
+      }
+    );
 
     return ok(
       res,
       updatedOrder,
-      'Order status updated'
+      "Order status updated"
     );
   }
 );
@@ -1370,85 +1100,57 @@ exports.updateOrderStatus = asyncHandler(
 
 exports.assignDeliveryPerson = asyncHandler(
   async (req, res) => {
-    const orderId = validId(
-      req.params.id
-    );
+    const orderId = validId(req.params.id);
 
     if (!orderId) {
-      return fail(
-        res,
-        'Invalid order ID',
-        400
-      );
+      return fail(res, "Invalid order ID", 400);
     }
 
     const name = String(
-      req.body?.assignedPersonName ||
-        ''
+      req.body?.assignedPersonName || ""
     ).trim();
 
     const mobile = String(
-      req.body?.assignedPersonMobile ||
-        ''
-    ).replace(
-      /[^\d+]/g,
-      ''
-    );
+      req.body?.assignedPersonMobile || ""
+    ).replace(/[^\d+]/g, "");
 
     if (
       !name ||
-      mobile.replace(/\D/g, '').length < 10
+      mobile.replace(/\D/g, "").length < 10
     ) {
       return fail(
         res,
-        'Valid delivery person name and mobile required',
+        "Valid delivery person name and mobile required",
         400
       );
     }
 
-    const row =
-      await Order.findByPk(
-        orderId
-      );
+    const row = await Order.findByPk(orderId);
 
     if (!row) {
-      return fail(
-        res,
-        'Order not found',
-        404
-      );
+      return fail(res, "Order not found", 404);
     }
 
     if (
-      [
-        'DELIVERED',
-        'CANCELLED'
-      ].includes(
-        row.status
-      )
+      ["DELIVERED", "CANCELLED"].includes(row.status)
     ) {
       return fail(
         res,
-        'Cannot assign closed order',
+        "Cannot assign closed order",
         409
       );
     }
 
     await row.update({
-      assignedPersonName:
-        name,
-
-      assignedPersonMobile:
-        mobile,
-
-      assignedAt:
-        new Date()
+      assignedPersonName: name,
+      assignedPersonMobile: mobile,
+      assignedAt: new Date(),
     });
 
     return ok(
       res,
       row,
-      'Delivery person assigned'
+      "Delivery person assigned"
     );
   }
 );
@@ -1463,62 +1165,58 @@ exports.retryCashfreePayment = asyncHandler(
     const orderId = validId(req.params.id);
 
     if (!orderId) {
-      return fail(
-        res,
-        'Invalid order ID',
-        400
-      );
+      return fail(res, "Invalid order ID", 400);
     }
 
     const order = await Order.findOne({
       where: {
         id: orderId,
         userId: req.user.id,
-        paymentMethod: 'CASHFREE'
-      }
+        paymentMethod: "CASHFREE",
+      },
     });
 
     if (!order) {
       return fail(
         res,
-        'Cashfree order not found',
+        "Cashfree order not found",
         404
       );
     }
 
-    if (order.status === 'CANCELLED') {
+    if (order.status === "CANCELLED") {
       return fail(
         res,
-        'Cancelled orders cannot be paid',
+        "Cancelled orders cannot be paid",
         409
       );
     }
 
-    if (order.paymentStatus === 'PAID') {
+    if (order.paymentStatus === "PAID") {
       return ok(
         res,
         {
           order,
           orderId: order.id,
-          paymentStatus: 'PAID',
+          paymentStatus: "PAID",
           isPaid: true,
-          cashfree: null
+          cashfree: null,
         },
-        'Order is already paid'
+        "Order is already paid"
       );
     }
 
     const payment = await Payment.findOne({
       where: {
         orderId: order.id,
-        provider: 'CASHFREE'
-      }
+        provider: "CASHFREE",
+      },
     });
 
     if (!payment) {
       return fail(
         res,
-        'Cashfree payment record not found',
+        "Cashfree payment record not found",
         404
       );
     }
@@ -1526,38 +1224,39 @@ exports.retryCashfreePayment = asyncHandler(
     // Verify only when a real Cashfree reference exists.
     if (payment.cashfreeOrderId) {
       try {
-        const verifiedOrder =
-          await syncCashfreeOrder(order.id);
+        const verifiedOrder = await syncCashfreeOrder(
+          order.id
+        );
 
         if (
-          verifiedOrder.paymentStatus === 'PAID'
+          verifiedOrder.paymentStatus === "PAID"
         ) {
           return ok(
             res,
             {
               order: verifiedOrder,
               orderId: verifiedOrder.id,
-              paymentStatus: 'PAID',
+              paymentStatus: "PAID",
               isPaid: true,
-              cashfree: null
+              cashfree: null,
             },
-            'Order is already paid'
+            "Order is already paid"
           );
         }
       } catch (error) {
         if (
           error.cashfreeStatus === 404 &&
-          error.cashfreeCode === 'order_not_found'
+          error.cashfreeCode === "order_not_found"
         ) {
           console.warn(
-            '[RETRY PAYMENT] Clearing stale Cashfree order:',
+            "[RETRY PAYMENT] Clearing stale Cashfree order:",
             payment.cashfreeOrderId
           );
 
           await payment.update({
             cashfreeOrderId: null,
             cashfreeSessionId: null,
-            status: 'PENDING'
+            status: "PENDING",
           });
         } else {
           throw error;
@@ -1565,25 +1264,25 @@ exports.retryCashfreePayment = asyncHandler(
       }
     }
 
-    const latestOrder =
-      await Order.findByPk(orderId);
+    const latestOrder = await Order.findByPk(
+      orderId
+    );
 
     if (
       !latestOrder ||
-      latestOrder.status === 'CANCELLED'
+      latestOrder.status === "CANCELLED"
     ) {
       return fail(
         res,
-        'Order is not available for payment',
+        "Order is not available for payment",
         409
       );
     }
 
-    const cashfree =
-      await createCashfreeSession(
-        latestOrder,
-        req.user
-      );
+    const cashfree = await createCashfreeSession(
+      latestOrder,
+      req.user
+    );
 
     if (
       !cashfree ||
@@ -1593,7 +1292,7 @@ exports.retryCashfreePayment = asyncHandler(
     ) {
       return fail(
         res,
-        'Cashfree did not return complete payment session details',
+        "Cashfree did not return complete payment session details",
         502
       );
     }
@@ -1605,19 +1304,16 @@ exports.retryCashfreePayment = asyncHandler(
         orderId: latestOrder.id,
         paymentStatus: latestOrder.paymentStatus,
         isPaid: false,
-
         cashfree: {
           paymentSessionId:
             cashfree.paymentSessionId,
-
           cashfreeOrderId:
             cashfree.cashfreeOrderId,
-
           environment:
-            cashfree.environment
-        }
+            cashfree.environment,
+        },
       },
-      'Cashfree payment session ready'
+      "Cashfree payment session ready"
     );
   }
 );
@@ -1628,76 +1324,72 @@ exports.retryCashfreePayment = asyncHandler(
 
 exports.whatsappOrder = asyncHandler(
   async (req, res) => {
-    const orderId = validId(
-      req.params.id
-    );
+    const orderId = validId(req.params.id);
 
     if (!orderId) {
-      return fail(
-        res,
-        'Invalid order ID',
-        400
-      );
+      return fail(res, "Invalid order ID", 400);
     }
 
-    const row =
-      await Order.findByPk(
-        orderId,
-        {
-          include: [
-            {
-              model: User,
-              as: 'user'
-            },
-            {
-              model: OrderItem,
-              as: 'items'
-            }
-          ]
-        }
-      );
+    const row = await Order.findByPk(
+      orderId,
+      {
+        include: [
+          {
+            model: User,
+            as: "user",
+          },
+          {
+            model: OrderItem,
+            as: "items",
+          },
+        ],
+      }
+    );
 
     if (!row) {
-      return fail(
-        res,
-        'Order not found',
-        404
-      );
+      return fail(res, "Order not found", 404);
     }
 
-    const a =
-      row.addressSnapshot ||
-      {};
+    const a = row.addressSnapshot || {};
 
-    const items =
-      row.items
-        .map(
-          (item) =>
-            `${item.productName} x ${item.quantity}`
-        )
-        .join('\n');
+    // Display total product quantity with unit.
+    //
+    // Product unit: 1kg
+    // Ordered quantity: 2
+    // WhatsApp: banana - 2 kg
+
+    const items = row.items
+      .map((item) => {
+        const quantityText = formatOrderedQuantity(
+          item.productUnit,
+          item.quantity
+        );
+
+        return `${item.productName} - ${quantityText}`;
+      })
+      .join("\n");
 
     const message = [
       `TWINTO Order ${row.orderNumber}`,
 
       `Customer: ${
-        row.user?.name || ''
+        row.user?.name || ""
       } (${
-        row.user?.mobile || ''
+        row.user?.mobile || ""
       })`,
 
       `Delivery: ${
-        a.name || ''
+        a.name || ""
       }, ${
-        a.addressLine1 || ''
+        a.addressLine1 || ""
       } ${
-        a.addressLine2 || ''
+        a.addressLine2 || ""
       }, ${
-        a.city || ''
+        a.city || ""
       }, ${
-        a.state || ''
+        a.state || ""
       } ${
-        a.pincode || ''
+        a.pincode || ""
       }`,
 
       `Items:\n${items}`,
@@ -1709,32 +1401,25 @@ exports.whatsappOrder = asyncHandler(
       `Payment Status: ${row.paymentStatus}`,
 
       `Assigned: ${
-        row.assignedPersonName ||
-        'Not assigned'
+        row.assignedPersonName || "Not assigned"
       } ${
-        row.assignedPersonMobile ||
-        ''
+        row.assignedPersonMobile || ""
       }`,
 
-      `Status: ${row.status}`
-    ].join('\n');
+      `Status: ${row.status}`,
+    ].join("\n");
 
-    const number =
-      String(
-        row.assignedPersonMobile ||
-          row.user?.mobile ||
-          ''
-      ).replace(
-        /\D/g,
-        ''
-      );
+    const number = String(
+      row.assignedPersonMobile ||
+      row.user?.mobile ||
+      ""
+    ).replace(/\D/g, "");
 
     return ok(res, {
       whatsappUrl:
         `https://wa.me/${number}` +
         `?text=${encodeURIComponent(message)}`,
-
-      message
+      message,
     });
   }
 );
